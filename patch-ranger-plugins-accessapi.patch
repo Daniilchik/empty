@@ -1,0 +1,1488 @@
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaAccessApiClient.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaAccessApiClient.java
+new file mode 100644
+index 000000000..82405aa11
+--- /dev/null
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaAccessApiClient.java
+@@ -0,0 +1,432 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
++import org.apache.hadoop.security.authentication.client.KerberosAuthenticator;
++import org.apache.hadoop.security.authentication.client.ConnectionConfigurator;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import javax.net.ssl.HttpsURLConnection;
++import javax.net.ssl.KeyManagerFactory;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLSocketFactory;
++import javax.net.ssl.TrustManager;
++import javax.net.ssl.TrustManagerFactory;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import java.net.HttpURLConnection;
++import java.net.URL;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import java.security.KeyFactory;
++import java.security.KeyStore;
++import java.security.PrivateKey;
++import java.security.cert.Certificate;
++import java.security.cert.CertificateFactory;
++import java.security.spec.PKCS8EncodedKeySpec;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * Клиент AccessAPI (СУДиС), заменяющий прямой поход в FreeIPA по LDAP.
++ *
++ * Используется один эндпоинт — {@code GET /idm/find?login=<LOGIN>}; из ответа
++ * берётся поле {@code memberof}. Полная выгрузка каталога недоступна: эндпоинты
++ * /idm/groups и /idm/allgroups закрыты ролевой моделью, поэтому
++ * {@link #supportsFullSync()} возвращает false, а группы резолвятся лениво
++ * через {@link IpaLazyGroupResolver}.
++ *
++ * Аутентификация — SPNEGO (по keytab сервиса) либо mTLS с клиентским
++ * сертификатом; выбирается настройкой {@link IpaConfig#API_AUTH}.
++ */
++public class IpaAccessApiClient implements IpaUserGroupSource {
++    private static final Logger LOG = LoggerFactory.getLogger(IpaAccessApiClient.class);
++
++    private final IpaConfig cfg;
++    private final AtomicReference<SSLSocketFactory> mtlsFactory  = new AtomicReference<>();
++    private final AtomicReference<SSLSocketFactory> trustFactory = new AtomicReference<>();
++    private final AtomicReference<UserGroupInformation> apiUgi   = new AtomicReference<>();
++
++    public IpaAccessApiClient(IpaConfig cfg) {
++        this.cfg = cfg;
++    }
++
++    @Override
++    public boolean supportsFullSync() {
++        return false;
++    }
++
++    @Override
++    public Map<String, Set<String>> fetchUserGroups() {
++        throw new UnsupportedOperationException(
++                "AccessAPI не отдаёт весь каталог: /idm/groups и /idm/allgroups закрыты ролевой "
++                        + "моделью. Группы резолвятся лениво по одному пользователю.");
++    }
++
++    @Override
++    public Set<String> fetchGroupsForUser(String user) throws IOException {
++        String url = cfg.getApiUrl() + "/idm/find?login="
++                + URLEncoder.encode(user, StandardCharsets.UTF_8.name());
++
++        String body = get(url);
++        if (body == null || body.isEmpty()) {
++            return Collections.emptySet();
++        }
++
++        Set<String> groups = new LinkedHashSet<>();
++        for (String g : JsonLite.extractStringArray(body, "memberof")) {
++            if (!cfg.getGroupExclude().contains(g)) {
++                groups.add(g);
++            }
++        }
++        return groups;
++    }
++
++    // ──────────────────────────── HTTP ────────────────────────────
++
++    private String get(String url) throws IOException {
++        HttpURLConnection conn;
++        if (cfg.isApiAuthGateway()) {
++            conn = openPlain(url);
++        } else if (cfg.isApiAuthMtls()) {
++            conn = openMtls(url);
++        } else {
++            conn = openSpnego(url);
++        }
++        conn.setRequestMethod("GET");
++        conn.setConnectTimeout(cfg.getConnectTimeoutMs());
++        conn.setReadTimeout(cfg.getReadTimeoutMs());
++        conn.setRequestProperty("Accept", "application/json");
++
++        try {
++            int code = conn.getResponseCode();
++            if (code == HttpURLConnection.HTTP_NOT_FOUND) {
++                // Пользователя нет в каталоге — валидный ответ, не ошибка.
++                return null;
++            }
++            if (code != HttpURLConnection.HTTP_OK) {
++                throw new IOException("AccessAPI returned HTTP " + code + " for " + stripQuery(url)
++                        + (code == HttpURLConnection.HTTP_UNAUTHORIZED
++                        || code == HttpURLConnection.HTTP_FORBIDDEN
++                        ? " (проверьте членство сервисной УЗ в группе доступа)" : ""));
++            }
++            try (InputStream in = conn.getInputStream()) {
++                return readAll(in);
++            }
++        } finally {
++            conn.disconnect();
++        }
++    }
++
++    /**
++     * SPNEGO. Токен намеренно создаётся на каждый запрос: он живёт недолго,
++     * а расшаривать его между потоками небезопасно (AuthenticatedURL.Token
++     * изменяемый и не потокобезопасный).
++     *
++     * Если задан {@link IpaConfig#API_CA_CERT}, TLS проверяется по нему, а не
++     * по JVM truststore: сертификат AccessAPI обычно подписан корпоративным CA,
++     * которого в cacerts образа нет — иначе получаем SSLException ещё до SPNEGO.
++     */
++    private HttpURLConnection openSpnego(String url) throws IOException {
++        final SSLSocketFactory factory = trustOnlySocketFactory();
++        final ConnectionConfigurator configurator = conn -> {
++            if (factory != null && conn instanceof HttpsURLConnection) {
++                ((HttpsURLConnection) conn).setSSLSocketFactory(factory);
++            }
++            return conn;
++        };
++        try {
++            return apiUgi().doAs(
++                    (java.security.PrivilegedExceptionAction<HttpURLConnection>) () -> {
++                        AuthenticatedURL.Token token = new AuthenticatedURL.Token();
++                        return new AuthenticatedURL(new KerberosAuthenticator(), configurator)
++                                .openConnection(new URL(url), token);
++                    });
++        } catch (IOException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IOException("SPNEGO request failed for " + stripQuery(url), e);
++        }
++    }
++
++    /**
++     * Запрос без клиентских креденшелов на стороне приложения.
++     *
++     * Режим {@value IpaConfig#API_AUTH_GATEWAY}: аутентификацию выполняет egress
++     * gateway — он терминирует трафик и предъявляет AccessAPI клиентский
++     * сертификат (mode=MUTUAL), CN которого зарегистрирован в СУДиС. Плагин
++     * при этом шлёт обычный HTTP внутрь mesh, где хоп до gateway защищён mTLS
++     * самого mesh. Kerberos не участвует — это снимает проблему обращения к
++     * сервису в чужом realm.
++     */
++    private HttpURLConnection openPlain(String url) throws IOException {
++        return (HttpURLConnection) new URL(url).openConnection();
++    }
++
++    /**
++     * UGI, от имени которого идёт запрос к AccessAPI.
++     *
++     * По умолчанию — принципал самого демона. Но AccessAPI живёт в корпоративном
++     * realm, и группа доступа выдаётся корпоративной ТУЗ; принципал вида
++     * om/om@<realm кластера> в неё не входит и без cross-realm доверия даже не
++     * получит service ticket. Поэтому при заданных {@link IpaConfig#API_PRINCIPAL}
++     * и {@link IpaConfig#API_KEYTAB} логинимся отдельной УЗ и ходим от неё.
++     */
++    private UserGroupInformation apiUgi() throws IOException {
++        String principal = cfg.getApiPrincipal();
++        String keytab    = cfg.getApiKeytab();
++        if (principal == null || principal.isEmpty() || keytab == null || keytab.isEmpty()) {
++            return UserGroupInformation.getLoginUser();
++        }
++        UserGroupInformation ugi = apiUgi.get();
++        if (ugi == null) {
++            synchronized (apiUgi) {
++                ugi = apiUgi.get();
++                if (ugi == null) {
++                    ugi = UserGroupInformation
++                            .loginUserFromKeytabAndReturnUGI(principal, keytab);
++                    apiUgi.set(ugi);
++                    LOG.info("AccessAPI: authenticating as {} (keytab {})", principal, keytab);
++                }
++            }
++        }
++        // UGI из loginUserFromKeytabAndReturnUGI не обновляется фоновым renewer'ом,
++        // поэтому продлеваем сами — иначе через lifetime билета всё встанет.
++        ugi.checkTGTAndReloginFromKeytab();
++        return ugi;
++    }
++
++    /** Truststore из {@link IpaConfig#API_CA_CERT}; null — использовать JVM-дефолт. */
++    private SSLSocketFactory trustOnlySocketFactory() throws IOException {
++        String ca = cfg.getApiCaCert();
++        if (ca == null || ca.isEmpty()) {
++            return null;
++        }
++        SSLSocketFactory cached = trustFactory.get();
++        if (cached != null) return cached;
++        try {
++            SSLContext ctx = SSLContext.getInstance("TLS");
++            ctx.init(null, buildTrustManagers(ca), null);
++            SSLSocketFactory f = ctx.getSocketFactory();
++            trustFactory.set(f);
++            return f;
++        } catch (IOException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IOException("failed to build trust store from " + ca, e);
++        }
++    }
++
++    private TrustManager[] buildTrustManagers(String caPath) throws Exception {
++        KeyStore ts = KeyStore.getInstance(KeyStore.getDefaultType());
++        ts.load(null, null);
++        int i = 0;
++        for (Certificate c : readCertificates(caPath)) {
++            ts.setCertificateEntry("accessapi-ca-" + (i++), c);
++        }
++        TrustManagerFactory tmf =
++                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
++        tmf.init(ts);
++        return tmf.getTrustManagers();
++    }
++
++    private HttpURLConnection openMtls(String url) throws IOException {
++        URL u = new URL(url);
++        HttpURLConnection conn = (HttpURLConnection) u.openConnection();
++        if (conn instanceof HttpsURLConnection) {
++            ((HttpsURLConnection) conn).setSSLSocketFactory(mtlsSocketFactory());
++        } else {
++            LOG.warn("{}={} is not https, client certificate will not be used",
++                    IpaConfig.API_URL, stripQuery(url));
++        }
++        return conn;
++    }
++
++    private SSLSocketFactory mtlsSocketFactory() throws IOException {
++        SSLSocketFactory cached = mtlsFactory.get();
++        if (cached != null) return cached;
++
++        try {
++            KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
++            ks.load(null, null);
++            ks.setKeyEntry("client",
++                    readPrivateKey(cfg.getApiClientKey()),
++                    new char[0],
++                    readCertChain(cfg.getApiClientCert()));
++
++            KeyManagerFactory kmf =
++                    KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
++            kmf.init(ks, new char[0]);
++
++            TrustManager[] trustManagers = null;
++            if (cfg.getApiCaCert() != null && !cfg.getApiCaCert().isEmpty()) {
++                trustManagers = buildTrustManagers(cfg.getApiCaCert());
++            }
++
++            SSLContext ctx = SSLContext.getInstance("TLS");
++            ctx.init(kmf.getKeyManagers(), trustManagers, null);
++            SSLSocketFactory f = ctx.getSocketFactory();
++            mtlsFactory.set(f);
++            return f;
++        } catch (IOException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IOException("failed to build mTLS context from "
++                    + cfg.getApiClientCert() + " / " + cfg.getApiClientKey(), e);
++        }
++    }
++
++    // ──────────────────────────── PEM ────────────────────────────
++
++    private static Certificate[] readCertChain(String path) throws IOException {
++        Collection<? extends Certificate> certs = readCertificates(path);
++        return certs.toArray(new Certificate[0]);
++    }
++
++    private static Collection<? extends Certificate> readCertificates(String path)
++            throws IOException {
++        try (InputStream in = Files.newInputStream(Paths.get(path))) {
++            CertificateFactory cf = CertificateFactory.getInstance("X.509");
++            return cf.generateCertificates(in);
++        } catch (java.security.cert.CertificateException e) {
++            throw new IOException("failed to read certificates from " + path, e);
++        }
++    }
++
++    /** Ожидается PKCS#8 PEM ({@code -----BEGIN PRIVATE KEY-----}) — формат, который отдаёт Vault. */
++    private static PrivateKey readPrivateKey(String path) throws IOException {
++        String pem = new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8);
++        String base64 = pem
++                .replaceAll("-----BEGIN (RSA )?PRIVATE KEY-----", "")
++                .replaceAll("-----END (RSA )?PRIVATE KEY-----", "")
++                .replaceAll("\\s", "");
++        if (base64.isEmpty()) {
++            throw new IOException("no PEM private key found in " + path);
++        }
++        byte[] der = Base64.getDecoder().decode(base64);
++        try {
++            return KeyFactory.getInstance("RSA")
++                    .generatePrivate(new PKCS8EncodedKeySpec(der));
++        } catch (Exception e) {
++            throw new IOException("failed to parse private key from " + path
++                    + " (ожидается PKCS#8: -----BEGIN PRIVATE KEY-----)", e);
++        }
++    }
++
++    // ──────────────────────────── utils ────────────────────────────
++
++    private static String readAll(InputStream in) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        try (Reader r = new InputStreamReader(in, StandardCharsets.UTF_8)) {
++            char[] buf = new char[4096];
++            int n;
++            while ((n = r.read(buf)) > 0) {
++                sb.append(buf, 0, n);
++            }
++        }
++        return sb.toString();
++    }
++
++    /** Логин не должен попадать в логи/сообщения об ошибках. */
++    private static String stripQuery(String url) {
++        int q = url.indexOf('?');
++        return q < 0 ? url : url.substring(0, q);
++    }
++
++    /**
++     * Минимальный разбор JSON под одну задачу: достать строковый массив по имени поля.
++     *
++     * Полноценный парсер (Jackson) сюда сознательно не тащим: модуль грузится
++     * через ranger-plugin-classloader, и лишняя зависимость рискует разъехаться
++     * с версией в runtime. Нужен ровно один тип значения — массив строк.
++     */
++    static final class JsonLite {
++        private JsonLite() {}
++
++        static List<String> extractStringArray(String json, String field) {
++            List<String> out = new ArrayList<>();
++            String needle = "\"" + field + "\"";
++            int from = 0;
++            while (true) {
++                int k = json.indexOf(needle, from);
++                if (k < 0) break;
++                int colon = json.indexOf(':', k + needle.length());
++                if (colon < 0) break;
++
++                int p = skipWs(json, colon + 1);
++                if (p >= json.length() || json.charAt(p) != '[') {
++                    from = k + needle.length();
++                    continue;
++                }
++                p++; // '['
++                while (p < json.length()) {
++                    p = skipWs(json, p);
++                    if (p >= json.length() || json.charAt(p) == ']') break;
++                    if (json.charAt(p) == ',') { p++; continue; }
++                    if (json.charAt(p) != '"') break;
++                    StringBuilder sb = new StringBuilder();
++                    p++; // открывающая кавычка
++                    while (p < json.length() && json.charAt(p) != '"') {
++                        char c = json.charAt(p);
++                        if (c == '\\' && p + 1 < json.length()) {
++                            p++;
++                            sb.append(unescape(json.charAt(p)));
++                        } else {
++                            sb.append(c);
++                        }
++                        p++;
++                    }
++                    p++; // закрывающая кавычка
++                    String v = sb.toString().trim();
++                    if (!v.isEmpty()) out.add(v);
++                }
++                from = p;
++            }
++            return out;
++        }
++
++        private static char unescape(char c) {
++            switch (c) {
++                case 'n': return '\n';
++                case 't': return '\t';
++                case 'r': return '\r';
++                case 'b': return '\b';
++                case 'f': return '\f';
++                default:  return c;   // \" \\ \/ и прочее — как есть
++            }
++        }
++
++        private static int skipWs(String s, int i) {
++            while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
++            return i;
++        }
++    }
++}
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java
+index 8ec1959e4..e9b3a1be5 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java
+@@ -23,10 +23,52 @@
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ public final class IpaConfig {
+     public static final String PREFIX = "org.apache.ranger.ipa.";
+ 
++    /** Источник данных: {@value #SOURCE_LDAP} (по умолчанию) или {@value #SOURCE_ACCESS_API}. */
++    public static final String SOURCE          = PREFIX + "source";
++    public static final String SOURCE_LDAP     = "ldap";
++    public static final String SOURCE_ACCESS_API = "accessapi";
++
++    public static final String API_URL             = PREFIX + "accessapi.url";
++    public static final String API_AUTH            = PREFIX + "accessapi.auth";
++    /** SPNEGO по keytab (требует принципала в realm сервиса). */
++    public static final String API_AUTH_KERBEROS   = "kerberos";
++    /** Клиентский сертификат предъявляет само приложение. */
++    public static final String API_AUTH_MTLS       = "mtls";
++    /** Клиентский сертификат предъявляет egress gateway; приложение шлёт plain HTTP. */
++    public static final String API_AUTH_GATEWAY    = "gateway";
++    public static final String API_PRINCIPAL       = PREFIX + "accessapi.kerberos.principal";
++    public static final String API_KEYTAB          = PREFIX + "accessapi.kerberos.keytab";
++    public static final String API_CLIENT_CERT     = PREFIX + "accessapi.tls.client.cert.file";
++    public static final String API_CLIENT_KEY      = PREFIX + "accessapi.tls.client.key.file";
++    public static final String API_CA_CERT         = PREFIX + "accessapi.tls.ca.cert.file";
++    public static final String API_CACHE_TTL_MS    = PREFIX + "accessapi.cache.ttl.ms";
++    public static final String API_NEG_CACHE_TTL_MS= PREFIX + "accessapi.cache.negative.ttl.ms";
++    public static final String GROUP_EXCLUDE       = PREFIX + "group.exclude";
++    public static final String SERVICE_USERS       = PREFIX + "service.users";
++
++    /**
++     * Служебные группы FreeIPA, которые есть почти у каждого и в Ranger-политиках
++     * не используются. Отфильтровываем, чтобы не раздувать список групп.
++     */
++    private static final String DEFAULT_GROUP_EXCLUDE = "ipausers,allow_all_users,technology-users";
++
++    /**
++     * Сервисные УЗ демонов Ozone/Hadoop (short-name принципалов om/om@REALM и т.д.)
++     * плюс псевдопользователи Hadoop. В AccessAPI (СУДиС) их нет — это не реальные
++     * сотрудники, поэтому запрос по ним всегда даёт 404/ошибку и зря светит имя УЗ
++     * в API. Для таких пользователей сразу возвращаем пустой список групп, минуя
++     * обращение к источнику. Сопоставление регистронезависимое.
++     */
++    private static final String DEFAULT_SERVICE_USERS =
++            "om,scm,s3g,recon,datanode,dn,hadoop,root,ozone,http,dr.who";
++
+     public static final String ENABLED                  = PREFIX + "enabled";
+     public static final String LDAP_URL                 = PREFIX + "ldap.url";
+     public static final String LDAP_BASE_DN             = PREFIX + "ldap.base.dn";
+@@ -61,6 +103,19 @@ public final class IpaConfig {
+     private final int     connectTimeoutMs;
+     private final int     readTimeoutMs;
+ 
++    private final String      source;
++    private final String      apiUrl;
++    private final String      apiAuth;
++    private final String      apiPrincipal;
++    private final String      apiKeytab;
++    private final String      apiClientCert;
++    private final String      apiClientKey;
++    private final String      apiCaCert;
++    private final long        apiCacheTtlMs;
++    private final long        apiNegativeCacheTtlMs;
++    private final Set<String> groupExclude;
++    private final Set<String> serviceUsers;
++
+     public IpaConfig(Configuration conf) {
+         this.enabled         = conf.getBoolean(ENABLED, false);
+         this.ldapUrl         = conf.get(LDAP_URL);
+@@ -77,17 +132,48 @@ public IpaConfig(Configuration conf) {
+         this.connectTimeoutMs= conf.getInt(CONNECT_TIMEOUT_MS,  10_000);
+         this.readTimeoutMs   = conf.getInt(READ_TIMEOUT_MS,     30_000);
+ 
+-        if (enabled) {
+-            require(ldapUrl, LDAP_URL);
+-            require(baseDn,  LDAP_BASE_DN);
+-            this.bindDn       = readSingleLine(conf.get(LDAP_BIND_DN_FILE),       LDAP_BIND_DN_FILE);
+-            this.bindPassword = readSingleLine(conf.get(LDAP_BIND_PASSWORD_FILE), LDAP_BIND_PASSWORD_FILE);
+-            if (ldapUrl.toLowerCase().startsWith("ldaps://")) {
+-                require(caCertPath, TLS_CA_CERT_FILE);
++        this.source                = conf.get(SOURCE, SOURCE_LDAP).trim().toLowerCase();
++        this.apiUrl                = trimTrailingSlash(conf.get(API_URL));
++        this.apiAuth               = conf.get(API_AUTH, API_AUTH_KERBEROS).trim().toLowerCase();
++        this.apiPrincipal          = conf.get(API_PRINCIPAL);
++        this.apiKeytab             = conf.get(API_KEYTAB);
++        this.apiClientCert         = conf.get(API_CLIENT_CERT);
++        this.apiClientKey          = conf.get(API_CLIENT_KEY);
++        this.apiCaCert             = conf.get(API_CA_CERT);
++        this.apiCacheTtlMs         = conf.getLong(API_CACHE_TTL_MS,     300_000L);
++        this.apiNegativeCacheTtlMs = conf.getLong(API_NEG_CACHE_TTL_MS,  60_000L);
++        this.groupExclude          = splitToSet(conf.get(GROUP_EXCLUDE, DEFAULT_GROUP_EXCLUDE));
++        this.serviceUsers          = splitToLowerSet(conf.get(SERVICE_USERS, DEFAULT_SERVICE_USERS));
++
++        if (!enabled) {
++            this.bindDn = null;
++            this.bindPassword = null;
++            return;
++        }
++
++        if (isAccessApiSource()) {
++            require(apiUrl, API_URL);
++            if (API_AUTH_MTLS.equals(apiAuth)) {
++                require(apiClientCert, API_CLIENT_CERT);
++                require(apiClientKey,  API_CLIENT_KEY);
++            } else if (!API_AUTH_KERBEROS.equals(apiAuth)
++                    && !API_AUTH_GATEWAY.equals(apiAuth)) {
++                throw new IllegalStateException(API_AUTH + " must be one of '"
++                        + API_AUTH_KERBEROS + "', '" + API_AUTH_MTLS + "', '"
++                        + API_AUTH_GATEWAY + "', got: " + apiAuth);
+             }
+-        } else {
++            // LDAP-настройки при source=accessapi не нужны.
+             this.bindDn = null;
+             this.bindPassword = null;
++            return;
++        }
++
++        require(ldapUrl, LDAP_URL);
++        require(baseDn,  LDAP_BASE_DN);
++        this.bindDn       = readSingleLine(conf.get(LDAP_BIND_DN_FILE),       LDAP_BIND_DN_FILE);
++        this.bindPassword = readSingleLine(conf.get(LDAP_BIND_PASSWORD_FILE), LDAP_BIND_PASSWORD_FILE);
++        if (ldapUrl.toLowerCase().startsWith("ldaps://")) {
++            require(caCertPath, TLS_CA_CERT_FILE);
+         }
+     }
+ 
+@@ -108,9 +194,64 @@ public IpaConfig(Configuration conf) {
+     public int     getConnectTimeoutMs() { return connectTimeoutMs; }
+     public int     getReadTimeoutMs()    { return readTimeoutMs; }
+ 
++    public String      getSource()                { return source; }
++    public boolean     isAccessApiSource()        { return SOURCE_ACCESS_API.equals(source); }
++    public String      getApiUrl()                { return apiUrl; }
++    public String      getApiAuth()               { return apiAuth; }
++    public boolean     isApiAuthMtls()            { return API_AUTH_MTLS.equals(apiAuth); }
++    public boolean     isApiAuthGateway()         { return API_AUTH_GATEWAY.equals(apiAuth); }
++    public String      getApiPrincipal()          { return apiPrincipal; }
++    public String      getApiKeytab()             { return apiKeytab; }
++    public String      getApiClientCert()         { return apiClientCert; }
++    public String      getApiClientKey()          { return apiClientKey; }
++    public String      getApiCaCert()             { return apiCaCert; }
++    public long        getApiCacheTtlMs()         { return apiCacheTtlMs; }
++    public long        getApiNegativeCacheTtlMs() { return apiNegativeCacheTtlMs; }
++    public Set<String> getGroupExclude()          { return groupExclude; }
++    public Set<String> getServiceUsers()          { return serviceUsers; }
++
++    /**
++     * true — пользователь сервисный (демон Ozone/Hadoop), группы для него в
++     * AccessAPI искать не нужно. Регистронезависимо; null/пустой — не сервисный.
++     */
++    public boolean isServiceUser(String user) {
++        if (user == null || user.isEmpty()) return false;
++        return serviceUsers.contains(user.toLowerCase());
++    }
++
+     public String getUserSearchDn()  { return joinDn(userSearchBase,  baseDn); }
+     public String getGroupSearchDn() { return joinDn(groupSearchBase, baseDn); }
+ 
++    private static String trimTrailingSlash(String url) {
++        if (url == null) return null;
++        String s = url.trim();
++        while (s.endsWith("/")) {
++            s = s.substring(0, s.length() - 1);
++        }
++        return s;
++    }
++
++    private static Set<String> splitToSet(String csv) {
++        Set<String> out = new HashSet<>();
++        if (csv == null) return Collections.unmodifiableSet(out);
++        for (String part : csv.split(",")) {
++            String v = part.trim();
++            if (!v.isEmpty()) out.add(v);
++        }
++        return Collections.unmodifiableSet(out);
++    }
++
++    /** Как {@link #splitToSet}, но в нижнем регистре — для регистронезависимых сравнений. */
++    private static Set<String> splitToLowerSet(String csv) {
++        Set<String> out = new HashSet<>();
++        if (csv == null) return Collections.unmodifiableSet(out);
++        for (String part : csv.split(",")) {
++            String v = part.trim().toLowerCase();
++            if (!v.isEmpty()) out.add(v);
++        }
++        return Collections.unmodifiableSet(out);
++    }
++
+     private static String joinDn(String relative, String base) {
+         if (relative == null || relative.isEmpty()) return base;
+         return relative + "," + base;
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java
+index 0d88f6425..51ebe734f 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java
+@@ -25,22 +25,42 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Set;
+ 
+ public class IpaGroupMapping implements GroupMappingServiceProvider, Configurable {
+     private static final Logger LOG = LoggerFactory.getLogger(IpaGroupMapping.class);
+ 
+     private static final Object        START_LOCK = new Object();
+     private static volatile IpaSyncJob runningJob;
++    /** Ненулевой, когда источник не умеет полную выгрузку (AccessAPI). */
++    private static volatile IpaLazyGroupResolver lazyResolver;
++    /** Сервисные УЗ демонов — для них источник не опрашиваем. */
++    private static volatile Set<String> serviceUsers = Collections.emptySet();
+ 
+     private Configuration conf;
+ 
+     @Override
+     public List<String> getGroups(String user) {
++        // Сервисные УЗ (om/scm/s3g/hadoop/...) в AccessAPI отсутствуют — не ходим
++        // за ними в источник, сразу пустой список. Иначе на каждый self-lookup
++        // демона получаем 404/SSL-ошибку и светим имя УЗ в API.
++        if (user != null && serviceUsers.contains(user.toLowerCase())) {
++            return new ArrayList<>();
++        }
++        IpaLazyGroupResolver resolver = lazyResolver;
++        if (resolver != null) {
++            return new ArrayList<>(resolver.groupsOf(user));
++        }
+         return new ArrayList<>(IpaUserGroupCache.INSTANCE.groupsOf(user));
+     }
+ 
+     @Override
+-    public void cacheGroupsRefresh() {}
++    public void cacheGroupsRefresh() {
++        IpaLazyGroupResolver resolver = lazyResolver;
++        if (resolver != null) {
++            resolver.invalidateAll();
++        }
++    }
+ 
+     @Override
+     public void cacheGroupsAdd(List<String> groups) {}
+@@ -53,6 +73,7 @@ public void setConf(Configuration conf) {
+             LOG.info("IpaGroupMapping: {}=false, returning empty groups", IpaConfig.ENABLED);
+             return;
+         }
++        serviceUsers = cfg.getServiceUsers();
+         ensureStarted(cfg);
+     }
+ 
+@@ -62,12 +83,26 @@ public Configuration getConf() {
+     }
+ 
+     private static void ensureStarted(IpaConfig cfg) {
+-        if (runningJob != null) return;
++        if (runningJob != null || lazyResolver != null) return;
+         synchronized (START_LOCK) {
+-            if (runningJob != null) return;
+-            IpaSyncJob job = new IpaSyncJob(cfg, new IpaLdapClient(cfg), IpaUserGroupCache.INSTANCE);
+-            job.start();
+-            runningJob = job;
++            if (runningJob != null || lazyResolver != null) return;
++
++            IpaUserGroupSource source = cfg.isAccessApiSource()
++                    ? new IpaAccessApiClient(cfg)
++                    : new IpaLdapClient(cfg);
++
++            if (source.supportsFullSync()) {
++                IpaSyncJob job = new IpaSyncJob(cfg, source, IpaUserGroupCache.INSTANCE);
++                job.start();
++                runningJob = job;
++                LOG.info("IpaGroupMapping: source={}, full sync every {}ms",
++                        cfg.getSource(), cfg.getSyncIntervalMs());
++            } else {
++                lazyResolver = new IpaLazyGroupResolver(
++                        source, cfg.getApiCacheTtlMs(), cfg.getApiNegativeCacheTtlMs());
++                LOG.info("IpaGroupMapping: source={} url={} auth={}, lazy resolve, ttl={}ms",
++                        cfg.getSource(), cfg.getApiUrl(), cfg.getApiAuth(), cfg.getApiCacheTtlMs());
++            }
+         }
+     }
+ 
+@@ -78,7 +113,19 @@ static void resetForTests() {
+                 runningJob.interrupt();
+                 runningJob = null;
+             }
++            lazyResolver = null;
++            serviceUsers = Collections.emptySet();
+             IpaUserGroupCache.INSTANCE.swap(Collections.emptyMap());
+         }
+     }
++
++    /** Test hook only. */
++    static void setLazyResolverForTests(IpaLazyGroupResolver resolver) {
++        lazyResolver = resolver;
++    }
++
++    /** Test hook only. */
++    static void setServiceUsersForTests(Set<String> users) {
++        serviceUsers = users;
++    }
+ }
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLazyGroupResolver.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLazyGroupResolver.java
+new file mode 100644
+index 000000000..68aa69358
+--- /dev/null
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLazyGroupResolver.java
+@@ -0,0 +1,160 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Ленивый резолвер групп поверх источника, который не умеет полную выгрузку
++ * (AccessAPI). Держит per-user кеш с TTL.
++ *
++ * Поведение при недоступности источника намеренно консервативное: если есть
++ * протухшая запись, отдаём её, а не пустой список. Пустой список для Hadoop
++ * означает "у пользователя нет групп" и молча срежет Ranger-политики, поэтому
++ * протухшие данные тут безопаснее свежего "ничего".
++ */
++public class IpaLazyGroupResolver {
++    private static final Logger LOG = LoggerFactory.getLogger(IpaLazyGroupResolver.class);
++
++    private final IpaUserGroupSource source;
++    private final long               ttlMs;
++    private final long               negativeTtlMs;
++
++    private final ConcurrentHashMap<String, Entry>  cache = new ConcurrentHashMap<>();
++    /** Ключи single-flight: по одному пользователю — один запрос к API. */
++    private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
++
++    public IpaLazyGroupResolver(IpaUserGroupSource source, long ttlMs, long negativeTtlMs) {
++        this.source        = source;
++        this.ttlMs         = ttlMs;
++        this.negativeTtlMs = negativeTtlMs;
++    }
++
++    public Set<String> groupsOf(String user) {
++        if (user == null || user.isEmpty()) return Collections.emptySet();
++
++        Entry cached = cache.get(user);
++        long now = System.currentTimeMillis();
++        if (cached != null && now < cached.expiresAt) {
++            return cached.groups;
++        }
++
++        // Single-flight: параллельные запросы по одному пользователю не должны
++        // порождать несколько обращений к API.
++        Object lock = locks.computeIfAbsent(user, k -> new Object());
++        try {
++            synchronized (lock) {
++                // Пока ждали — мог обновить другой поток.
++                Entry again = cache.get(user);
++                if (again != null && System.currentTimeMillis() < again.expiresAt) {
++                    return again.groups;
++                }
++                return fetchAndCache(user, cached);
++            }
++        } finally {
++            locks.remove(user, lock);
++        }
++    }
++
++    private Set<String> fetchAndCache(String user, Entry stale) {
++        try {
++            Set<String> groups = source.fetchGroupsForUser(user);
++            Set<String> immutable = Collections.unmodifiableSet(new HashSet<>(groups));
++            long ttl = immutable.isEmpty() ? negativeTtlMs : ttlMs;
++            cache.put(user, new Entry(immutable, System.currentTimeMillis() + ttl));
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("resolved {} groups for user={}", immutable.size(), user);
++            }
++            return immutable;
++        } catch (Exception e) {
++            if (stale != null) {
++                // Продлеваем протухшую запись на negativeTtl, чтобы не долбить
++                // недоступный API на каждый запрос авторизации.
++                cache.put(user, new Entry(stale.groups, System.currentTimeMillis() + negativeTtlMs));
++                LOG.warn("AccessAPI lookup failed for user={}, serving stale {} groups: {}",
++                        user, stale.groups.size(), describe(e));
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug("AccessAPI lookup stack trace for user=" + user, e);
++                }
++                return stale.groups;
++            }
++            LOG.warn("AccessAPI lookup failed for user={}, no cached data: {}",
++                    user, describe(e));
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("AccessAPI lookup stack trace for user=" + user, e);
++            }
++            cache.put(user, new Entry(Collections.emptySet(),
++                    System.currentTimeMillis() + negativeTtlMs));
++            return Collections.emptySet();
++        }
++    }
++
++    /**
++     * Разворачивает цепочку причин в одну строку. Без этого в WARN попадает
++     * только обёртка (например SSLException от KerberosAuthenticator), а
++     * настоящая причина — вроде "unable to find valid certification path" —
++     * видна лишь при DEBUG.
++     */
++    private static String describe(Throwable e) {
++        StringBuilder sb = new StringBuilder();
++        Throwable t = e;
++        int depth = 0;
++        while (t != null && depth++ < 5) {
++            if (sb.length() > 0) sb.append(" <- ");
++            sb.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
++            if (t.getCause() == t) break;
++            t = t.getCause();
++        }
++        return sb.toString();
++    }
++
++    /** Сбросить кеш (вызывается из cacheGroupsRefresh()). */
++    public void invalidateAll() {
++        cache.clear();
++    }
++
++    /** Точечный сброс. */
++    public void invalidate(String user) {
++        if (user != null) cache.remove(user);
++    }
++
++    public int size() {
++        return cache.size();
++    }
++
++    /** Только для тестов. */
++    Map<String, Entry> snapshot() {
++        return Collections.unmodifiableMap(cache);
++    }
++
++    static final class Entry {
++        final Set<String> groups;
++        final long        expiresAt;
++
++        Entry(Set<String> groups, long expiresAt) {
++            this.groups    = groups;
++            this.expiresAt = expiresAt;
++        }
++    }
++}
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java
+index f5897394d..47124b56e 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java
+@@ -45,7 +45,7 @@
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+-public class IpaLdapClient {
++public class IpaLdapClient implements IpaUserGroupSource {
+     private final IpaConfig cfg;
+     private final AtomicReference<SSLSocketFactory> cachedFactory = new AtomicReference<>();
+ 
+@@ -53,6 +53,24 @@ public IpaLdapClient(IpaConfig cfg) {
+         this.cfg = cfg;
+     }
+ 
++    /** LDAP отдаёт весь каталог разом — синкаем в фоне снапшотом. */
++    @Override
++    public boolean supportsFullSync() {
++        return true;
++    }
++
++    /**
++     * Группы одного пользователя. Для LDAP-источника отдельный запрос не нужен:
++     * основной режим — полная выгрузка в {@link IpaUserGroupCache}. Метод
++     * оставлен ради контракта {@link IpaUserGroupSource} и точечных проверок.
++     */
++    @Override
++    public Set<String> fetchGroupsForUser(String user) throws NamingException, IOException {
++        Set<String> groups = fetchUserGroups().get(user);
++        return groups == null ? Collections.emptySet() : groups;
++    }
++
++    @Override
+     public Map<String, Set<String>> fetchUserGroups() throws NamingException, IOException {
+         DirContext ctx = connect();
+         try {
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java
+index 8c8138100..30e0a8fde 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java
+@@ -29,13 +29,13 @@ public class IpaSyncJob extends Thread {
+     static final long INITIAL_BACKOFF_MS = 5_000L;
+     static final long MAX_BACKOFF_MS     = 120_000L;
+ 
+-    private final IpaConfig         cfg;
+-    private final IpaLdapClient     client;
+-    private final IpaUserGroupCache cache;
++    private final IpaConfig          cfg;
++    private final IpaUserGroupSource client;
++    private final IpaUserGroupCache  cache;
+ 
+     private volatile long currentBackoffMs = INITIAL_BACKOFF_MS;
+ 
+-    public IpaSyncJob(IpaConfig cfg, IpaLdapClient client, IpaUserGroupCache cache) {
++    public IpaSyncJob(IpaConfig cfg, IpaUserGroupSource client, IpaUserGroupCache cache) {
+         super("IpaSyncJob");
+         setDaemon(true);
+         this.cfg    = cfg;
+@@ -45,7 +45,8 @@ public IpaSyncJob(IpaConfig cfg, IpaLdapClient client, IpaUserGroupCache cache)
+ 
+     @Override
+     public void run() {
+-        LOG.info("IpaSyncJob started; interval={}ms url={}", cfg.getSyncIntervalMs(), cfg.getLdapUrl());
++        LOG.info("IpaSyncJob started; interval={}ms source={} url={}",
++                cfg.getSyncIntervalMs(), cfg.getSource(), cfg.getLdapUrl());
+         while (!Thread.currentThread().isInterrupted()) {
+             long sleep = cfg.getSyncIntervalMs();
+             try {
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaUserGroupSource.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaUserGroupSource.java
+new file mode 100644
+index 000000000..af70fa130
+--- /dev/null
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaUserGroupSource.java
+@@ -0,0 +1,55 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Источник соответствия "пользователь -> группы".
++ *
++ * Две реализации отличаются тем, какие запросы им доступны:
++ *
++ *  - {@link IpaLdapClient} читает FreeIPA по LDAP и умеет выгрузить весь
++ *    каталог разом ({@link #fetchUserGroups()}), поэтому работает через
++ *    периодический {@link IpaSyncJob} со снапшотом в {@link IpaUserGroupCache}.
++ *
++ *  - {@link IpaAccessApiClient} ходит в AccessAPI по HTTP. Полная выгрузка
++ *    там недоступна (эндпоинты /idm/groups и /idm/allgroups закрыты ролевой
++ *    моделью), доступен только запрос по конкретному логину — поэтому группы
++ *    резолвятся лениво, по запросу, с TTL-кешем.
++ */
++public interface IpaUserGroupSource {
++
++    /**
++     * Полная выгрузка каталога: uid -> набор имён групп.
++     * Вызывать только если {@link #supportsFullSync()} вернул true.
++     */
++    Map<String, Set<String>> fetchUserGroups() throws Exception;
++
++    /**
++     * Группы одного пользователя. Пустое множество, если пользователь
++     * не найден — это не ошибка (у Hadoop "нет групп" - валидный ответ).
++     */
++    Set<String> fetchGroupsForUser(String user) throws Exception;
++
++    /**
++     * true, если источник умеет отдавать весь каталог разом и его можно
++     * синкать в фоне; false — резолвим лениво по одному пользователю.
++     */
++    boolean supportsFullSync();
++}
+diff --git a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaAccessApiClientTest.java b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaAccessApiClientTest.java
+new file mode 100644
+index 000000000..d753092ba
+--- /dev/null
++++ b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaAccessApiClientTest.java
+@@ -0,0 +1,201 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import org.apache.hadoop.conf.Configuration;
++import org.junit.Test;
++
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++public class IpaAccessApiClientTest {
++
++    /** Реальный ответ /idm/find?login=... из документации AccessAPI. */
++    private static final String SAMPLE = "{"
++            + "\"displayname\" : \"Максим Евгеньевич Ушаков\","
++            + "\"name\" : \"u_sklsdpfess_s_corr_risk_dme\","
++            + "\"uid\" : \"u_sklsdpfess_s_corr_risk_dme\","
++            + "\"title\" : \"DOTOOLS-36831\","
++            + "\"as_info\" : [ \"INFRST\" ],"
++            + "\"uidnumber\" : \"1600693725\","
++            + "\"memberof\" : [ \"g_dc_d_custom_risk_dme_tscorr_ro\", \"technology-users\","
++            + " \"allow_all_users\", \"ipausers\" ],"
++            + "\"hbacs\" : [ \"allow_all_users_services\", \"allow_all\" ],"
++            + "\"sudorules\" : [ ],"
++            + "\"locked\" : false"
++            + "}";
++
++    @Test
++    public void extractsMemberofArray() {
++        List<String> groups = IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "memberof");
++
++        assertEquals(4, groups.size());
++        assertEquals("g_dc_d_custom_risk_dme_tscorr_ro", groups.get(0));
++        assertTrue(groups.contains("ipausers"));
++    }
++
++    @Test
++    public void doesNotConfuseOtherArrays() {
++        List<String> hbacs = IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "hbacs");
++        assertEquals(2, hbacs.size());
++        assertTrue(hbacs.contains("allow_all"));
++
++        List<String> sudo = IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "sudorules");
++        assertTrue(sudo.isEmpty());
++    }
++
++    @Test
++    public void missingFieldGivesEmptyList() {
++        assertTrue(IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "nosuchfield").isEmpty());
++        assertTrue(IpaAccessApiClient.JsonLite.extractStringArray("", "memberof").isEmpty());
++        assertTrue(IpaAccessApiClient.JsonLite.extractStringArray("{}", "memberof").isEmpty());
++    }
++
++    /** Ответ на поиск по группе — массив объектов, у каждого свой memberof. */
++    @Test
++    public void handlesArrayOfUsers() {
++        String json = "[ {\"uid\":\"a\",\"memberof\":[\"g1\"]}, {\"uid\":\"b\",\"memberof\":[\"g2\",\"g3\"]} ]";
++        List<String> all = IpaAccessApiClient.JsonLite.extractStringArray(json, "memberof");
++        assertEquals(3, all.size());
++    }
++
++    @Test
++    public void unescapesQuotedValues() {
++        String json = "{\"memberof\":[\"g_with_\\\"quote\\\"\",\"g_norm\"]}";
++        List<String> groups = IpaAccessApiClient.JsonLite.extractStringArray(json, "memberof");
++        assertEquals(2, groups.size());
++        assertEquals("g_with_\"quote\"", groups.get(0));
++    }
++
++    @Test
++    public void fullSyncIsNotSupported() {
++        IpaAccessApiClient client = new IpaAccessApiClient(accessApiConfig());
++        assertFalse(client.supportsFullSync());
++        try {
++            client.fetchUserGroups();
++            org.junit.Assert.fail("expected UnsupportedOperationException");
++        } catch (UnsupportedOperationException expected) {
++            assertTrue(expected.getMessage().contains("AccessAPI"));
++        }
++    }
++
++    @Test
++    public void configParsesAccessApiSettings() {
++        IpaConfig cfg = accessApiConfig();
++
++        assertTrue(cfg.isAccessApiSource());
++        assertEquals("https://dataapi.dev.df.sbrf.ru", cfg.getApiUrl());
++        assertEquals(IpaConfig.API_AUTH_KERBEROS, cfg.getApiAuth());
++        assertFalse(cfg.isApiAuthMtls());
++        // Служебные группы по умолчанию отфильтровываются.
++        assertTrue(cfg.getGroupExclude().contains("ipausers"));
++        assertTrue(cfg.getGroupExclude().contains("allow_all_users"));
++    }
++
++    @Test
++    public void trailingSlashInUrlIsTrimmed() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "https://dataapi.dev.df.sbrf.ru///");
++        assertEquals("https://dataapi.dev.df.sbrf.ru", new IpaConfig(conf).getApiUrl());
++    }
++
++    @Test
++    public void ldapSettingsNotRequiredForAccessApiSource() {
++        // Ни ldap.url, ни bind-файлов нет — конструктор не должен падать.
++        IpaConfig cfg = accessApiConfig();
++        assertTrue(cfg.isEnabled());
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void mtlsRequiresClientCert() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL,  "https://dataapi-mtls.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, IpaConfig.API_AUTH_MTLS);
++        new IpaConfig(conf);
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void unknownAuthModeRejected() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL,  "https://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, "basic");
++        new IpaConfig(conf);
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void apiUrlIsRequired() {
++        new IpaConfig(baseConf());
++    }
++
++    @Test
++    public void apiPrincipalAndKeytabAreReadWhenSet() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "http://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_PRINCIPAL, "u_sdp_s_accessapi@DEV.DF.SBRF.RU");
++        conf.set(IpaConfig.API_KEYTAB, "/vault/secrets/om-accessapi.keytab");
++
++        IpaConfig cfg = new IpaConfig(conf);
++        assertEquals("u_sdp_s_accessapi@DEV.DF.SBRF.RU", cfg.getApiPrincipal());
++        assertEquals("/vault/secrets/om-accessapi.keytab", cfg.getApiKeytab());
++    }
++
++    @Test
++    public void gatewayAuthNeedsNoClientCredentials() {
++        // Аутентифицирует egress gateway своим сертификатом — от приложения
++        // не требуется ни keytab, ни клиентский сертификат.
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "http://dataapi-mtls.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, IpaConfig.API_AUTH_GATEWAY);
++
++        IpaConfig cfg = new IpaConfig(conf);
++        assertTrue(cfg.isApiAuthGateway());
++        assertFalse(cfg.isApiAuthMtls());
++        assertNull(cfg.getApiClientCert());
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void unknownAuthModeIsRejected() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "http://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, "basic");
++        new IpaConfig(conf);
++    }
++
++    @Test
++    public void apiPrincipalIsOptionalAndFallsBackToDaemonIdentity() {
++        IpaConfig cfg = accessApiConfig();
++        assertNull(cfg.getApiPrincipal());
++        assertNull(cfg.getApiKeytab());
++    }
++
++    private static Configuration baseConf() {
++        Configuration conf = new Configuration(false);
++        conf.setBoolean(IpaConfig.ENABLED, true);
++        conf.set(IpaConfig.SOURCE, IpaConfig.SOURCE_ACCESS_API);
++        return conf;
++    }
++
++    private static IpaConfig accessApiConfig() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "https://dataapi.dev.df.sbrf.ru");
++        return new IpaConfig(conf);
++    }
++}
+diff --git a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java
+index 581de99d8..fca119faa 100644
+--- a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java
++++ b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java
+@@ -74,6 +74,50 @@ public void unknownUserReturnsEmptyList() {
+         assertTrue(mapping.getGroups("nobody").isEmpty());
+     }
+ 
++    @Test
++    public void serviceUserIsSkippedEvenIfPresentInCache() {
++        // om есть в кеше, но помечен как сервисный — источник не опрашиваем,
++        // getGroups обязан вернуть пусто до обращения к кешу/резолверу.
++        IpaUserGroupCache.INSTANCE.swap(singleUser("om", "should-not-leak"));
++        IpaGroupMapping.setServiceUsersForTests(
++                new HashSet<>(java.util.Arrays.asList("om", "scm", "s3g")));
++
++        IpaGroupMapping mapping = new IpaGroupMapping();
++        assertTrue(mapping.getGroups("om").isEmpty());
++    }
++
++    @Test
++    public void serviceUserMatchIsCaseInsensitive() {
++        IpaUserGroupCache.INSTANCE.swap(singleUser("OM", "x"));
++        IpaGroupMapping.setServiceUsersForTests(Collections.singleton("om"));
++
++        IpaGroupMapping mapping = new IpaGroupMapping();
++        assertTrue(mapping.getGroups("OM").isEmpty());
++    }
++
++    @Test
++    public void nonServiceUserStillResolvesFromCache() {
++        IpaUserGroupCache.INSTANCE.swap(singleUser("alice", "g1"));
++        IpaGroupMapping.setServiceUsersForTests(Collections.singleton("om"));
++
++        IpaGroupMapping mapping = new IpaGroupMapping();
++        List<String> groups = mapping.getGroups("alice");
++        assertEquals(1, groups.size());
++        assertTrue(groups.contains("g1"));
++    }
++
++    @Test
++    public void defaultServiceUsersCoverOzoneDaemons() {
++        IpaConfig cfg = new IpaConfig(new Configuration(false));
++        assertTrue(cfg.isServiceUser("om"));
++        assertTrue(cfg.isServiceUser("SCM"));
++        assertTrue(cfg.isServiceUser("s3g"));
++        assertTrue(cfg.isServiceUser("hadoop"));
++        assertTrue(cfg.isServiceUser("dr.who"));
++        assertTrue(!cfg.isServiceUser("alice"));
++        assertTrue(!cfg.isServiceUser(null));
++    }
++
+     @Test
+     public void cacheGroupsRefreshAndAddAreNoOps() {
+         IpaGroupMapping mapping = new IpaGroupMapping();
+diff --git a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaLazyGroupResolverTest.java b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaLazyGroupResolverTest.java
+new file mode 100644
+index 000000000..80c5c598f
+--- /dev/null
++++ b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaLazyGroupResolverTest.java
+@@ -0,0 +1,178 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import org.junit.Test;
++
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++public class IpaLazyGroupResolverTest {
++
++    /** Источник-заглушка: считает вызовы, умеет падать по требованию. */
++    private static final class StubSource implements IpaUserGroupSource {
++        final AtomicInteger calls = new AtomicInteger();
++        volatile Set<String> groups = set("g1", "g2");
++        volatile boolean fail;
++
++        @Override public boolean supportsFullSync() { return false; }
++
++        @Override public Map<String, Set<String>> fetchUserGroups() {
++            throw new UnsupportedOperationException();
++        }
++
++        @Override public Set<String> fetchGroupsForUser(String user) throws Exception {
++            calls.incrementAndGet();
++            if (fail) throw new java.io.IOException("AccessAPI unavailable");
++            return groups;
++        }
++    }
++
++    @Test
++    public void resolvesAndCaches() {
++        StubSource src = new StubSource();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 60_000L, 10_000L);
++
++        assertEquals(set("g1", "g2"), r.groupsOf("alice"));
++        assertEquals(set("g1", "g2"), r.groupsOf("alice"));
++        assertEquals("второй вызов должен прийти из кеша", 1, src.calls.get());
++    }
++
++    @Test
++    public void refetchesAfterTtl() throws Exception {
++        StubSource src = new StubSource();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 30L, 10L);
++
++        r.groupsOf("alice");
++        Thread.sleep(60L);
++        r.groupsOf("alice");
++
++        assertEquals(2, src.calls.get());
++    }
++
++    @Test
++    public void emptyResultUsesNegativeTtl() throws Exception {
++        StubSource src = new StubSource();
++        src.groups = Collections.emptySet();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 60_000L, 30L);
++
++        assertTrue(r.groupsOf("ghost").isEmpty());
++        assertEquals(1, src.calls.get());
++
++        // В пределах negative TTL повторного запроса нет.
++        assertTrue(r.groupsOf("ghost").isEmpty());
++        assertEquals(1, src.calls.get());
++
++        Thread.sleep(60L);
++        r.groupsOf("ghost");
++        assertEquals(2, src.calls.get());
++    }
++
++    /**
++     * Ключевое поведение: при недоступности API отдаём протухшие данные, а не
++     * пустой список — иначе Ranger молча срежет доступ пользователю.
++     */
++    @Test
++    public void servesStaleWhenSourceFails() throws Exception {
++        StubSource src = new StubSource();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 30L, 10L);
++
++        assertEquals(set("g1", "g2"), r.groupsOf("alice"));
++
++        src.fail = true;
++        Thread.sleep(60L);
++
++        assertEquals("должны получить протухший кеш, а не пустоту",
++                set("g1", "g2"), r.groupsOf("alice"));
++    }
++
++    @Test
++    public void returnsEmptyWhenSourceFailsAndNoCache() {
++        StubSource src = new StubSource();
++        src.fail = true;
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 60_000L, 10_000L);
++
++        assertTrue(r.groupsOf("alice").isEmpty());
++    }
++
++    @Test
++    public void nullAndEmptyUserAreSafe() {
++        StubSource src = new StubSource();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 60_000L, 10_000L);
++
++        assertTrue(r.groupsOf(null).isEmpty());
++        assertTrue(r.groupsOf("").isEmpty());
++        assertEquals("источник не должен вызываться", 0, src.calls.get());
++    }
++
++    @Test
++    public void invalidateForcesRefetch() {
++        StubSource src = new StubSource();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 60_000L, 10_000L);
++
++        r.groupsOf("alice");
++        r.invalidateAll();
++        r.groupsOf("alice");
++
++        assertEquals(2, src.calls.get());
++    }
++
++    /** Параллельные запросы по одному пользователю не должны множить обращения к API. */
++    @Test
++    public void singleFlightForSameUser() throws Exception {
++        StubSource src = new StubSource();
++        IpaLazyGroupResolver r = new IpaLazyGroupResolver(src, 60_000L, 10_000L);
++
++        int threads = 16;
++        ExecutorService pool = Executors.newFixedThreadPool(threads);
++        CountDownLatch start = new CountDownLatch(1);
++        CountDownLatch done  = new CountDownLatch(threads);
++
++        for (int i = 0; i < threads; i++) {
++            pool.submit(() -> {
++                try {
++                    start.await();
++                    r.groupsOf("alice");
++                } catch (InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                } finally {
++                    done.countDown();
++                }
++            });
++        }
++
++        start.countDown();
++        assertTrue(done.await(10, TimeUnit.SECONDS));
++        pool.shutdown();
++
++        assertEquals("ожидался один запрос к источнику", 1, src.calls.get());
++    }
++
++    private static Set<String> set(String... values) {
++        return new HashSet<>(java.util.Arrays.asList(values));
++    }
++}
