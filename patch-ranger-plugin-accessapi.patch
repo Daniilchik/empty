@@ -1,0 +1,1114 @@
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaAccessApiClient.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaAccessApiClient.java
+new file mode 100644
+index 000000000..cf70e45af
+--- /dev/null
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaAccessApiClient.java
+@@ -0,0 +1,436 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
++import org.apache.hadoop.security.authentication.client.KerberosAuthenticator;
++import org.apache.hadoop.security.authentication.client.ConnectionConfigurator;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import javax.net.ssl.HttpsURLConnection;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLSocketFactory;
++import javax.net.ssl.TrustManager;
++import javax.net.ssl.TrustManagerFactory;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import java.net.HttpURLConnection;
++import java.net.URL;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import java.security.KeyStore;
++import java.security.cert.Certificate;
++import java.security.cert.CertificateFactory;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.ArrayDeque;
++import java.util.Deque;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * AccessAPI client, an alternative to reading FreeIPA directly over LDAP.
++ *
++ * Uses a single endpoint, {@code GET /idm/find?login=<LOGIN>}, and reads the
++ * {@code memberof} field. The bulk endpoint {@code /idm/groups} returns groups
++ * with their members and is inverted into the uid -> groups map.
++ *
++ * Authentication is selected by {@link IpaConfig#API_AUTH}.
++ */
++public class IpaAccessApiClient implements IpaUserGroupSource {
++    private static final Logger LOG = LoggerFactory.getLogger(IpaAccessApiClient.class);
++
++    /** Field names in the bulk /idm/groups response. */
++    private static final String GROUP_NAME_FIELD    = "cn";
++    private static final String GROUP_MEMBERS_FIELD = "members";
++
++    private final IpaConfig cfg;
++    private final AtomicReference<SSLSocketFactory> trustFactory = new AtomicReference<>();
++    private final AtomicReference<UserGroupInformation> apiUgi   = new AtomicReference<>();
++
++    public IpaAccessApiClient(IpaConfig cfg) {
++        this.cfg = cfg;
++    }
++
++    @Override
++    public boolean supportsFullSync() {
++        return true;
++    }
++
++    @Override
++    public Map<String, Set<String>> fetchUserGroups() throws IOException {
++        String body = get(cfg.getApiUrl() + cfg.getApiGroupsPath());
++        Map<String, Set<String>> byUser = new HashMap<String, Set<String>>();
++        if (body == null || body.isEmpty()) {
++            return byUser;
++        }
++        int groups = 0;
++        for (String obj : JsonLite.objectsWithKey(body, GROUP_NAME_FIELD)) {
++            String cn = JsonLite.extractString(obj, GROUP_NAME_FIELD);
++            if (cn == null || cn.isEmpty() || cfg.getGroupExclude().contains(cn)) {
++                continue;
++            }
++            groups++;
++            for (String member : JsonLite.extractStringArray(obj, GROUP_MEMBERS_FIELD)) {
++                Set<String> s = byUser.get(member);
++                if (s == null) {
++                    s = new HashSet<String>();
++                    byUser.put(member, s);
++                }
++                s.add(cn);
++            }
++        }
++        LOG.info("AccessAPI full sync: {} groups, {} users", groups, byUser.size());
++        return byUser;
++    }
++
++    @Override
++    public Set<String> fetchGroupsForUser(String user) throws IOException {
++        String url = cfg.getApiUrl() + "/idm/find?login="
++                + URLEncoder.encode(user, StandardCharsets.UTF_8.name());
++
++        String body = get(url);
++        if (body == null || body.isEmpty()) {
++            return Collections.emptySet();
++        }
++
++        Set<String> groups = new LinkedHashSet<>();
++        for (String g : JsonLite.extractStringArray(body, "memberof")) {
++            if (!cfg.getGroupExclude().contains(g)) {
++                groups.add(g);
++            }
++        }
++        return groups;
++    }
++
++    private String get(String url) throws IOException {
++        HttpURLConnection conn = cfg.isApiAuthGateway() ? openPlain(url) : openSpnego(url);
++        conn.setRequestMethod("GET");
++        conn.setConnectTimeout(cfg.getConnectTimeoutMs());
++        conn.setReadTimeout(cfg.getReadTimeoutMs());
++        conn.setRequestProperty("Accept", "application/json");
++
++        try {
++            int code = conn.getResponseCode();
++            if (code == HttpURLConnection.HTTP_NOT_FOUND) {
++                // Not in the directory — a valid answer, not an error.
++                return null;
++            }
++            if (code != HttpURLConnection.HTTP_OK) {
++                throw new IOException("AccessAPI returned HTTP " + code + " for " + stripQuery(url)
++                        + (code == HttpURLConnection.HTTP_UNAUTHORIZED
++                        || code == HttpURLConnection.HTTP_FORBIDDEN
++                        ? " (check that the service account is in the API access group)" : ""));
++            }
++            try (InputStream in = conn.getInputStream()) {
++                return readAll(in);
++            }
++        } finally {
++            conn.disconnect();
++        }
++    }
++
++        /**
++     * SPNEGO. A fresh token per request on purpose: AuthenticatedURL.Token is
++     * mutable and not thread-safe.
++     *
++     * When {@link IpaConfig#API_CA_CERT} is set, TLS is verified against it instead
++     * of the JVM truststore — the corporate CA is usually missing from the image's
++     * cacerts, which would fail with SSLException before SPNEGO even starts.
++     */
++    private HttpURLConnection openSpnego(String url) throws IOException {
++        final SSLSocketFactory factory = trustOnlySocketFactory();
++        final ConnectionConfigurator configurator = conn -> {
++            if (factory != null && conn instanceof HttpsURLConnection) {
++                ((HttpsURLConnection) conn).setSSLSocketFactory(factory);
++            }
++            return conn;
++        };
++        try {
++            return apiUgi().doAs(
++                    (java.security.PrivilegedExceptionAction<HttpURLConnection>) () -> {
++                        AuthenticatedURL.Token token = new AuthenticatedURL.Token();
++                        return new AuthenticatedURL(new KerberosAuthenticator(), configurator)
++                                .openConnection(new URL(url), token);
++                    });
++        } catch (IOException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IOException("SPNEGO request failed for " + stripQuery(url), e);
++        }
++    }
++
++        /**
++     * Request without client credentials on the application side.
++     *
++     * In {@value IpaConfig#API_AUTH_GATEWAY} mode the egress gateway terminates the
++     * traffic and presents AccessAPI a client certificate whose CN is registered
++     * there. The application sends plain HTTP inside the mesh, where the hop to the
++     * gateway is protected by the mesh's own mTLS. Kerberos is not involved, which
++     * avoids having to reach a service in a foreign realm.
++     */
++    private HttpURLConnection openPlain(String url) throws IOException {
++        return (HttpURLConnection) new URL(url).openConnection();
++    }
++
++        /**
++     * UGI the AccessAPI request runs as; the daemon principal by default.
++     *
++     * AccessAPI lives in the corporate realm and grants access to a corporate
++     * account, which a principal like om/om@<cluster realm> does not belong to —
++     * without cross-realm trust it cannot even obtain a service ticket. Setting
++     * {@link IpaConfig#API_PRINCIPAL} and {@link IpaConfig#API_KEYTAB} logs in as a
++     * dedicated account instead.
++     */
++    private UserGroupInformation apiUgi() throws IOException {
++        String principal = cfg.getApiPrincipal();
++        String keytab    = cfg.getApiKeytab();
++        if (principal == null || principal.isEmpty() || keytab == null || keytab.isEmpty()) {
++            return UserGroupInformation.getLoginUser();
++        }
++        UserGroupInformation ugi = apiUgi.get();
++        if (ugi == null) {
++            synchronized (apiUgi) {
++                ugi = apiUgi.get();
++                if (ugi == null) {
++                    ugi = UserGroupInformation
++                            .loginUserFromKeytabAndReturnUGI(principal, keytab);
++                    apiUgi.set(ugi);
++                    LOG.info("AccessAPI: authenticating as {} (keytab {})", principal, keytab);
++                }
++            }
++        }
++                // This UGI has no background renewer, so the ticket is refreshed here;
++        // otherwise everything stops once the ticket lifetime expires.
++        ugi.checkTGTAndReloginFromKeytab();
++        return ugi;
++    }
++
++    /** Truststore from {@link IpaConfig#API_CA_CERT}; null means the JVM default. */
++    private SSLSocketFactory trustOnlySocketFactory() throws IOException {
++        String ca = cfg.getApiCaCert();
++        if (ca == null || ca.isEmpty()) {
++            return null;
++        }
++        SSLSocketFactory cached = trustFactory.get();
++        if (cached != null) return cached;
++        try {
++            SSLContext ctx = SSLContext.getInstance("TLS");
++            ctx.init(null, buildTrustManagers(ca), null);
++            SSLSocketFactory f = ctx.getSocketFactory();
++            trustFactory.set(f);
++            return f;
++        } catch (IOException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IOException("failed to build trust store from " + ca, e);
++        }
++    }
++
++    private TrustManager[] buildTrustManagers(String caPath) throws Exception {
++        KeyStore ts = KeyStore.getInstance(KeyStore.getDefaultType());
++        ts.load(null, null);
++        int i = 0;
++        for (Certificate c : readCertificates(caPath)) {
++            ts.setCertificateEntry("accessapi-ca-" + (i++), c);
++        }
++        TrustManagerFactory tmf =
++                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
++        tmf.init(ts);
++        return tmf.getTrustManagers();
++    }
++
++    private static Collection<? extends Certificate> readCertificates(String path)
++            throws IOException {
++        try (InputStream in = Files.newInputStream(Paths.get(path))) {
++            CertificateFactory cf = CertificateFactory.getInstance("X.509");
++            return cf.generateCertificates(in);
++        } catch (java.security.cert.CertificateException e) {
++            throw new IOException("failed to read certificates from " + path, e);
++        }
++    }
++
++    private static String readAll(InputStream in) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        try (Reader r = new InputStreamReader(in, StandardCharsets.UTF_8)) {
++            char[] buf = new char[4096];
++            int n;
++            while ((n = r.read(buf)) > 0) {
++                sb.append(buf, 0, n);
++            }
++        }
++        return sb.toString();
++    }
++
++    /** The login must never reach logs or error messages. */
++    private static String stripQuery(String url) {
++        int q = url.indexOf('?');
++        return q < 0 ? url : url.substring(0, q);
++    }
++
++        /**
++     * Minimal JSON reader for a single job: pull a string array out by field name.
++     *
++     * A full parser (Jackson) is deliberately avoided: the module is loaded through
++     * ranger-plugin-classloader, where an extra dependency risks clashing with the
++     * runtime version. Exactly one value type is needed — an array of strings.
++     */
++    static final class JsonLite {
++        private JsonLite() {}
++
++        static List<String> extractStringArray(String json, String field) {
++            List<String> out = new ArrayList<>();
++            String needle = "\"" + field + "\"";
++            int from = 0;
++            while (true) {
++                int k = json.indexOf(needle, from);
++                if (k < 0) break;
++                int colon = json.indexOf(':', k + needle.length());
++                if (colon < 0) break;
++
++                int p = skipWs(json, colon + 1);
++                if (p >= json.length() || json.charAt(p) != '[') {
++                    from = k + needle.length();
++                    continue;
++                }
++                p++; // '['
++                while (p < json.length()) {
++                    p = skipWs(json, p);
++                    if (p >= json.length() || json.charAt(p) == ']') break;
++                    if (json.charAt(p) == ',') { p++; continue; }
++                    if (json.charAt(p) != '"') break;
++                    StringBuilder sb = new StringBuilder();
++                    p++; // opening quote
++                    while (p < json.length() && json.charAt(p) != '"') {
++                        char c = json.charAt(p);
++                        if (c == '\\' && p + 1 < json.length()) {
++                            p++;
++                            sb.append(unescape(json.charAt(p)));
++                        } else {
++                            sb.append(c);
++                        }
++                        p++;
++                    }
++                    p++; // closing quote
++                    String v = sb.toString().trim();
++                    if (!v.isEmpty()) out.add(v);
++                }
++                from = p;
++            }
++            return out;
++        }
++
++        /** Objects at any depth that carry {@code key} at their own top level. */
++        static List<String> objectsWithKey(String json, String key) {
++            List<String> out = new ArrayList<String>();
++            Deque<Integer> starts = new ArrayDeque<Integer>();
++            boolean inStr = false;
++            for (int i = 0; i < json.length(); i++) {
++                char c = json.charAt(i);
++                if (inStr) {
++                    if (c == '\\') i++;
++                    else if (c == '"') inStr = false;
++                    continue;
++                }
++                if (c == '"') { inStr = true; continue; }
++                if (c == '{') { starts.push(i); continue; }
++                if (c == '}' && !starts.isEmpty()) {
++                    String span = json.substring(starts.pop(), i + 1);
++                    if (topLevelKeyPos(span, key) >= 0) out.add(span);
++                }
++            }
++            return out;
++        }
++
++        /** First string value of {@code field} at the object's top level; null if absent. */
++        static String extractString(String json, String field) {
++            int p = topLevelKeyPos(json, field);
++            if (p < 0) return null;
++            int colon = json.indexOf(':', p);
++            if (colon < 0) return null;
++            int q = skipWs(json, colon + 1);
++            if (q >= json.length() || json.charAt(q) != '"') return null;
++            StringBuilder sb = new StringBuilder();
++            q++;
++            while (q < json.length() && json.charAt(q) != '"') {
++                char c = json.charAt(q);
++                if (c == '\\' && q + 1 < json.length()) {
++                    q++;
++                    sb.append(unescape(json.charAt(q)));
++                } else {
++                    sb.append(c);
++                }
++                q++;
++            }
++            return sb.toString().trim();
++        }
++
++        /** Index of "key" sitting at depth 1 of {@code obj} and followed by ':'; -1 if absent. */
++        private static int topLevelKeyPos(String obj, String key) {
++            String needle = "\"" + key + "\"";
++            int depth = 0;
++            boolean inStr = false;
++            for (int i = 0; i < obj.length(); i++) {
++                char c = obj.charAt(i);
++                if (inStr) {
++                    if (c == '\\') i++;
++                    else if (c == '"') inStr = false;
++                    continue;
++                }
++                if (c == '"') {
++                    if (depth == 1 && obj.startsWith(needle, i)) {
++                        int colon = skipWs(obj, i + needle.length());
++                        if (colon < obj.length() && obj.charAt(colon) == ':') return i;
++                    }
++                    inStr = true;
++                    continue;
++                }
++                if (c == '{' || c == '[') depth++;
++                else if (c == '}' || c == ']') depth--;
++            }
++            return -1;
++        }
++
++        private static char unescape(char c) {
++            switch (c) {
++                case 'n': return '\n';
++                case 't': return '\t';
++                case 'r': return '\r';
++                case 'b': return '\b';
++                case 'f': return '\f';
++                default:  return c;   // \" \\ \/ and the rest — as is
++            }
++        }
++
++        private static int skipWs(String s, int i) {
++            while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
++            return i;
++        }
++    }
++}
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java
+index 8ec1959e4..93b688607 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaConfig.java
+@@ -23,10 +23,46 @@
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ public final class IpaConfig {
+     public static final String PREFIX = "org.apache.ranger.ipa.";
+ 
++    /** Data source: {@value #SOURCE_LDAP} (default) or {@value #SOURCE_ACCESS_API}. */
++    public static final String SOURCE          = PREFIX + "source";
++    public static final String SOURCE_LDAP     = "ldap";
++    public static final String SOURCE_ACCESS_API = "accessapi";
++
++    public static final String API_URL             = PREFIX + "accessapi.url";
++    public static final String API_AUTH            = PREFIX + "accessapi.auth";
++    /** SPNEGO with a service keytab. */
++    public static final String API_AUTH_KERBEROS   = "kerberos";
++    /** The egress gateway presents the certificate; the application sends plain HTTP. */
++    public static final String API_AUTH_GATEWAY    = "gateway";
++    public static final String API_PRINCIPAL       = PREFIX + "accessapi.kerberos.principal";
++    public static final String API_KEYTAB          = PREFIX + "accessapi.kerberos.keytab";
++    public static final String API_CA_CERT         = PREFIX + "accessapi.tls.ca.cert.file";
++    /** Bulk endpoint returning groups with their members. */
++    public static final String API_GROUPS_PATH     = PREFIX + "accessapi.groups.path";
++    public static final String GROUP_EXCLUDE       = PREFIX + "group.exclude";
++    public static final String SERVICE_USERS       = PREFIX + "service.users";
++
++        /**
++     * FreeIPA groups almost every user belongs to; they are never used in
++     * Ranger policies, so they are filtered out.
++     */
++    private static final String DEFAULT_GROUP_EXCLUDE = "ipausers,allow_all_users,technology-users";
++
++        /**
++     * Ozone/Hadoop daemon accounts. They do not exist in AccessAPI, so a lookup
++     * would only fail and leak the account name; an empty group list is returned
++     * without querying the source. Matched case-insensitively.
++     */
++    private static final String DEFAULT_SERVICE_USERS =
++            "om,scm,s3g,recon,datanode,dn,hadoop,root,ozone,http,dr.who";
++
+     public static final String ENABLED                  = PREFIX + "enabled";
+     public static final String LDAP_URL                 = PREFIX + "ldap.url";
+     public static final String LDAP_BASE_DN             = PREFIX + "ldap.base.dn";
+@@ -61,6 +97,16 @@ public final class IpaConfig {
+     private final int     connectTimeoutMs;
+     private final int     readTimeoutMs;
+ 
++    private final String      source;
++    private final String      apiUrl;
++    private final String      apiAuth;
++    private final String      apiPrincipal;
++    private final String      apiKeytab;
++    private final String      apiCaCert;
++    private final String  apiGroupsPath;
++    private final Set<String> groupExclude;
++    private final Set<String> serviceUsers;
++
+     public IpaConfig(Configuration conf) {
+         this.enabled         = conf.getBoolean(ENABLED, false);
+         this.ldapUrl         = conf.get(LDAP_URL);
+@@ -77,17 +123,40 @@ public IpaConfig(Configuration conf) {
+         this.connectTimeoutMs= conf.getInt(CONNECT_TIMEOUT_MS,  10_000);
+         this.readTimeoutMs   = conf.getInt(READ_TIMEOUT_MS,     30_000);
+ 
+-        if (enabled) {
+-            require(ldapUrl, LDAP_URL);
+-            require(baseDn,  LDAP_BASE_DN);
+-            this.bindDn       = readSingleLine(conf.get(LDAP_BIND_DN_FILE),       LDAP_BIND_DN_FILE);
+-            this.bindPassword = readSingleLine(conf.get(LDAP_BIND_PASSWORD_FILE), LDAP_BIND_PASSWORD_FILE);
+-            if (ldapUrl.toLowerCase().startsWith("ldaps://")) {
+-                require(caCertPath, TLS_CA_CERT_FILE);
++        this.source                = conf.get(SOURCE, SOURCE_LDAP).trim().toLowerCase();
++        this.apiUrl                = trimTrailingSlash(conf.get(API_URL));
++        this.apiAuth               = conf.get(API_AUTH, API_AUTH_KERBEROS).trim().toLowerCase();
++        this.apiPrincipal          = conf.get(API_PRINCIPAL);
++        this.apiKeytab             = conf.get(API_KEYTAB);
++        this.apiCaCert             = conf.get(API_CA_CERT);
++        this.apiGroupsPath         = conf.get(API_GROUPS_PATH, "/idm/groups").trim();
++        this.groupExclude          = splitToSet(conf.get(GROUP_EXCLUDE, DEFAULT_GROUP_EXCLUDE));
++        this.serviceUsers          = splitToLowerSet(conf.get(SERVICE_USERS, DEFAULT_SERVICE_USERS));
++
++        if (!enabled) {
++            this.bindDn = null;
++            this.bindPassword = null;
++            return;
++        }
++
++        if (isAccessApiSource()) {
++            require(apiUrl, API_URL);
++            if (!API_AUTH_KERBEROS.equals(apiAuth) && !API_AUTH_GATEWAY.equals(apiAuth)) {
++                throw new IllegalStateException(API_AUTH + " must be '"
++                        + API_AUTH_KERBEROS + "' or '" + API_AUTH_GATEWAY + "', got: " + apiAuth);
+             }
+-        } else {
++            // LDAP settings are not needed when source=accessapi.
+             this.bindDn = null;
+             this.bindPassword = null;
++            return;
++        }
++
++        require(ldapUrl, LDAP_URL);
++        require(baseDn,  LDAP_BASE_DN);
++        this.bindDn       = readSingleLine(conf.get(LDAP_BIND_DN_FILE),       LDAP_BIND_DN_FILE);
++        this.bindPassword = readSingleLine(conf.get(LDAP_BIND_PASSWORD_FILE), LDAP_BIND_PASSWORD_FILE);
++        if (ldapUrl.toLowerCase().startsWith("ldaps://")) {
++            require(caCertPath, TLS_CA_CERT_FILE);
+         }
+     }
+ 
+@@ -108,9 +177,60 @@ public IpaConfig(Configuration conf) {
+     public int     getConnectTimeoutMs() { return connectTimeoutMs; }
+     public int     getReadTimeoutMs()    { return readTimeoutMs; }
+ 
++    public String      getSource()                { return source; }
++    public boolean     isAccessApiSource()        { return SOURCE_ACCESS_API.equals(source); }
++    public String      getApiUrl()                { return apiUrl; }
++    public String      getApiAuth()               { return apiAuth; }
++    public boolean     isApiAuthGateway()         { return API_AUTH_GATEWAY.equals(apiAuth); }
++    public String      getApiGroupsPath()         { return apiGroupsPath; }
++    public String      getApiPrincipal()          { return apiPrincipal; }
++    public String      getApiKeytab()             { return apiKeytab; }
++    public String      getApiCaCert()             { return apiCaCert; }
++    public Set<String> getGroupExclude()          { return groupExclude; }
++    public Set<String> getServiceUsers()          { return serviceUsers; }
++
++        /**
++     * true for daemon accounts, whose groups must not be looked up.
++     * Case-insensitive; null or empty is not a service user.
++     */
++    public boolean isServiceUser(String user) {
++        if (user == null || user.isEmpty()) return false;
++        return serviceUsers.contains(user.toLowerCase());
++    }
++
+     public String getUserSearchDn()  { return joinDn(userSearchBase,  baseDn); }
+     public String getGroupSearchDn() { return joinDn(groupSearchBase, baseDn); }
+ 
++    private static String trimTrailingSlash(String url) {
++        if (url == null) return null;
++        String s = url.trim();
++        while (s.endsWith("/")) {
++            s = s.substring(0, s.length() - 1);
++        }
++        return s;
++    }
++
++    private static Set<String> splitToSet(String csv) {
++        Set<String> out = new HashSet<>();
++        if (csv == null) return Collections.unmodifiableSet(out);
++        for (String part : csv.split(",")) {
++            String v = part.trim();
++            if (!v.isEmpty()) out.add(v);
++        }
++        return Collections.unmodifiableSet(out);
++    }
++
++    /** Like {@link #splitToSet}, lowercased for case-insensitive matching. */
++    private static Set<String> splitToLowerSet(String csv) {
++        Set<String> out = new HashSet<>();
++        if (csv == null) return Collections.unmodifiableSet(out);
++        for (String part : csv.split(",")) {
++            String v = part.trim().toLowerCase();
++            if (!v.isEmpty()) out.add(v);
++        }
++        return Collections.unmodifiableSet(out);
++    }
++
+     private static String joinDn(String relative, String base) {
+         if (relative == null || relative.isEmpty()) return base;
+         return relative + "," + base;
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java
+index 0d88f6425..9515f1da4 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaGroupMapping.java
+@@ -25,17 +25,25 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Set;
+ 
+ public class IpaGroupMapping implements GroupMappingServiceProvider, Configurable {
+     private static final Logger LOG = LoggerFactory.getLogger(IpaGroupMapping.class);
+ 
+     private static final Object        START_LOCK = new Object();
+     private static volatile IpaSyncJob runningJob;
++    /** Daemon accounts; the source is never queried for them. */
++    private static volatile Set<String> serviceUsers = Collections.emptySet();
+ 
+     private Configuration conf;
+ 
+     @Override
+     public List<String> getGroups(String user) {
++        // Daemon accounts are absent from AccessAPI: every self-lookup would fail
++        // and leak the account name.
++        if (user != null && serviceUsers.contains(user.toLowerCase())) {
++            return new ArrayList<>();
++        }
+         return new ArrayList<>(IpaUserGroupCache.INSTANCE.groupsOf(user));
+     }
+ 
+@@ -53,6 +61,7 @@ public void setConf(Configuration conf) {
+             LOG.info("IpaGroupMapping: {}=false, returning empty groups", IpaConfig.ENABLED);
+             return;
+         }
++        serviceUsers = cfg.getServiceUsers();
+         ensureStarted(cfg);
+     }
+ 
+@@ -65,9 +74,16 @@ private static void ensureStarted(IpaConfig cfg) {
+         if (runningJob != null) return;
+         synchronized (START_LOCK) {
+             if (runningJob != null) return;
+-            IpaSyncJob job = new IpaSyncJob(cfg, new IpaLdapClient(cfg), IpaUserGroupCache.INSTANCE);
++
++            IpaUserGroupSource source = cfg.isAccessApiSource()
++                    ? new IpaAccessApiClient(cfg)
++                    : new IpaLdapClient(cfg);
++
++            IpaSyncJob job = new IpaSyncJob(cfg, source, IpaUserGroupCache.INSTANCE);
+             job.start();
+             runningJob = job;
++            LOG.info("IpaGroupMapping: source={}, full sync every {}ms",
++                    cfg.getSource(), cfg.getSyncIntervalMs());
+         }
+     }
+ 
+@@ -78,7 +94,13 @@ static void resetForTests() {
+                 runningJob.interrupt();
+                 runningJob = null;
+             }
++            serviceUsers = Collections.emptySet();
+             IpaUserGroupCache.INSTANCE.swap(Collections.emptyMap());
+         }
+     }
++
++    /** Test hook only. */
++    static void setServiceUsersForTests(Set<String> users) {
++        serviceUsers = users;
++    }
+ }
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java
+index f5897394d..4dde33db3 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaLdapClient.java
+@@ -45,7 +45,7 @@
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+-public class IpaLdapClient {
++public class IpaLdapClient implements IpaUserGroupSource {
+     private final IpaConfig cfg;
+     private final AtomicReference<SSLSocketFactory> cachedFactory = new AtomicReference<>();
+ 
+@@ -53,6 +53,24 @@ public IpaLdapClient(IpaConfig cfg) {
+         this.cfg = cfg;
+     }
+ 
++    /** LDAP can dump the whole directory, so it is synced in the background. */
++    @Override
++    public boolean supportsFullSync() {
++        return true;
++    }
++
++    /**
++     * Single-user lookup. Not used in the main flow — the full sync fills
++     * {@link IpaUserGroupCache} — but kept for the {@link IpaUserGroupSource}
++     * contract and for targeted checks.
++     */
++    @Override
++    public Set<String> fetchGroupsForUser(String user) throws NamingException, IOException {
++        Set<String> groups = fetchUserGroups().get(user);
++        return groups == null ? Collections.emptySet() : groups;
++    }
++
++    @Override
+     public Map<String, Set<String>> fetchUserGroups() throws NamingException, IOException {
+         DirContext ctx = connect();
+         try {
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java
+index 8c8138100..72779ad2d 100644
+--- a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaSyncJob.java
+@@ -29,13 +29,13 @@ public class IpaSyncJob extends Thread {
+     static final long INITIAL_BACKOFF_MS = 5_000L;
+     static final long MAX_BACKOFF_MS     = 120_000L;
+ 
+-    private final IpaConfig         cfg;
+-    private final IpaLdapClient     client;
+-    private final IpaUserGroupCache cache;
++    private final IpaConfig          cfg;
++    private final IpaUserGroupSource client;
++    private final IpaUserGroupCache  cache;
+ 
+     private volatile long currentBackoffMs = INITIAL_BACKOFF_MS;
+ 
+-    public IpaSyncJob(IpaConfig cfg, IpaLdapClient client, IpaUserGroupCache cache) {
++    public IpaSyncJob(IpaConfig cfg, IpaUserGroupSource client, IpaUserGroupCache cache) {
+         super("IpaSyncJob");
+         setDaemon(true);
+         this.cfg    = cfg;
+@@ -45,7 +45,9 @@ public IpaSyncJob(IpaConfig cfg, IpaLdapClient client, IpaUserGroupCache cache)
+ 
+     @Override
+     public void run() {
+-        LOG.info("IpaSyncJob started; interval={}ms url={}", cfg.getSyncIntervalMs(), cfg.getLdapUrl());
++        LOG.info("IpaSyncJob started; interval={}ms source={} url={}",
++                cfg.getSyncIntervalMs(), cfg.getSource(),
++                cfg.isAccessApiSource() ? cfg.getApiUrl() : cfg.getLdapUrl());
+         while (!Thread.currentThread().isInterrupted()) {
+             long sleep = cfg.getSyncIntervalMs();
+             try {
+diff --git a/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaUserGroupSource.java b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaUserGroupSource.java
+new file mode 100644
+index 000000000..a8db5c832
+--- /dev/null
++++ b/ranger-ipa-userstore/src/main/java/org/apache/ranger/plugin/ipa/IpaUserGroupSource.java
+@@ -0,0 +1,49 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Source of user -> groups mappings.
++ *
++ * {@link IpaLdapClient} can dump the whole directory, so it is synced in the
++ * background by {@link IpaSyncJob}. {@link IpaAccessApiClient} can only query a
++ * single login (bulk endpoints are closed by AccessAPI's role model), so its
++ * groups are resolved lazily with a TTL cache.
++ */
++public interface IpaUserGroupSource {
++
++        /**
++     * Full directory dump: uid -> group names.
++     * Only valid when {@link #supportsFullSync()} returns true.
++     */
++    Map<String, Set<String>> fetchUserGroups() throws Exception;
++
++        /**
++     * Groups of a single user. Empty set when the user is not found —
++     * for Hadoop that is a valid answer, not an error.
++     */
++    Set<String> fetchGroupsForUser(String user) throws Exception;
++
++        /**
++     * true if the source can dump the whole directory and be synced in the
++     * background; false means lazy per-user resolution.
++     */
++    boolean supportsFullSync();
++}
+diff --git a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaAccessApiClientTest.java b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaAccessApiClientTest.java
+new file mode 100644
+index 000000000..a69e30f2a
+--- /dev/null
++++ b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaAccessApiClientTest.java
+@@ -0,0 +1,237 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ranger.plugin.ipa;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++import org.apache.hadoop.conf.Configuration;
++import org.junit.Test;
++
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++public class IpaAccessApiClientTest {
++
++    /** A real /idm/find?login=... response, taken from the AccessAPI docs. */
++    private static final String SAMPLE = "{"
++            + "\"displayname\" : \"Test User\","
++            + "\"name\" : \"u_sklsdpfess_s_corr_risk_dme\","
++            + "\"uid\" : \"u_sklsdpfess_s_corr_risk_dme\","
++            + "\"title\" : \"DOTOOLS-36831\","
++            + "\"as_info\" : [ \"INFRST\" ],"
++            + "\"uidnumber\" : \"1600693725\","
++            + "\"memberof\" : [ \"g_dc_d_custom_risk_dme_tscorr_ro\", \"technology-users\","
++            + " \"allow_all_users\", \"ipausers\" ],"
++            + "\"hbacs\" : [ \"allow_all_users_services\", \"allow_all\" ],"
++            + "\"sudorules\" : [ ],"
++            + "\"locked\" : false"
++            + "}";
++
++    @Test
++    public void extractsMemberofArray() {
++        List<String> groups = IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "memberof");
++
++        assertEquals(4, groups.size());
++        assertEquals("g_dc_d_custom_risk_dme_tscorr_ro", groups.get(0));
++        assertTrue(groups.contains("ipausers"));
++    }
++
++    @Test
++    public void doesNotConfuseOtherArrays() {
++        List<String> hbacs = IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "hbacs");
++        assertEquals(2, hbacs.size());
++        assertTrue(hbacs.contains("allow_all"));
++
++        List<String> sudo = IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "sudorules");
++        assertTrue(sudo.isEmpty());
++    }
++
++    @Test
++    public void missingFieldGivesEmptyList() {
++        assertTrue(IpaAccessApiClient.JsonLite.extractStringArray(SAMPLE, "nosuchfield").isEmpty());
++        assertTrue(IpaAccessApiClient.JsonLite.extractStringArray("", "memberof").isEmpty());
++        assertTrue(IpaAccessApiClient.JsonLite.extractStringArray("{}", "memberof").isEmpty());
++    }
++
++    /** Group search response: an array of objects, each with its own memberof. */
++    @Test
++    public void handlesArrayOfUsers() {
++        String json = "[ {\"uid\":\"a\",\"memberof\":[\"g1\"]}, {\"uid\":\"b\",\"memberof\":[\"g2\",\"g3\"]} ]";
++        List<String> all = IpaAccessApiClient.JsonLite.extractStringArray(json, "memberof");
++        assertEquals(3, all.size());
++    }
++
++    @Test
++    public void unescapesQuotedValues() {
++        String json = "{\"memberof\":[\"g_with_\\\"quote\\\"\",\"g_norm\"]}";
++        List<String> groups = IpaAccessApiClient.JsonLite.extractStringArray(json, "memberof");
++        assertEquals(2, groups.size());
++        assertEquals("g_with_\"quote\"", groups.get(0));
++    }
++
++    @Test
++    public void fullSyncIsAlwaysSupported() {
++        assertTrue(new IpaAccessApiClient(accessApiConfig()).supportsFullSync());
++    }
++
++    /** /idm/groups shape: cn + members. Inverting it yields the user -> groups map. */
++    @Test
++    public void invertsGroupsResponseIntoUserToGroups() {
++        String json = "[ {\"cn\":\"g_a\",\"description\":\"d\",\"gidnumber\":\"1\","
++                + "\"members\":[\"alice\",\"bob\"]},"
++                + "{\"cn\":\"g_b\",\"members\":[\"bob\"]} ]";
++
++        List<String> objs = IpaAccessApiClient.JsonLite.objectsWithKey(json, "cn");
++        assertEquals(2, objs.size());
++
++        Map<String, Set<String>> byUser = new HashMap<String, Set<String>>();
++        for (String o : objs) {
++            String cn = IpaAccessApiClient.JsonLite.extractString(o, "cn");
++            for (String m : IpaAccessApiClient.JsonLite.extractStringArray(o, "members")) {
++                Set<String> s = byUser.get(m);
++                if (s == null) { s = new HashSet<String>(); byUser.put(m, s); }
++                s.add(cn);
++            }
++        }
++        assertEquals(2, byUser.size());
++        assertEquals(Collections.singleton("g_a"), byUser.get("alice"));
++        assertEquals(new HashSet<String>(Arrays.asList("g_a", "g_b")), byUser.get("bob"));
++    }
++
++    /** A wrapper object must not be mistaken for a group entry. */
++    @Test
++    public void ignoresWrapperObjectsWithoutCn() {
++        String json = "{\"result\":{\"count\":1,\"items\":[{\"cn\":\"g_a\",\"members\":[\"x\"]}]}}";
++        List<String> objs = IpaAccessApiClient.JsonLite.objectsWithKey(json, "cn");
++        assertEquals(1, objs.size());
++        assertEquals("g_a", IpaAccessApiClient.JsonLite.extractString(objs.get(0), "cn"));
++    }
++
++    /** A "cn" appearing only inside a nested value must not promote the outer object. */
++    @Test
++    public void extractStringIgnoresNestedKeys() {
++        String json = "{\"name\":\"outer\",\"inner\":{\"cn\":\"deep\"}}";
++        assertNull(IpaAccessApiClient.JsonLite.extractString(json, "cn"));
++    }
++
++    @Test
++    public void configParsesAccessApiSettings() {
++        IpaConfig cfg = accessApiConfig();
++
++        assertTrue(cfg.isAccessApiSource());
++        assertEquals("https://dataapi.dev.df.sbrf.ru", cfg.getApiUrl());
++        assertEquals(IpaConfig.API_AUTH_KERBEROS, cfg.getApiAuth());
++        // Well-known service groups are filtered out by default.
++        assertTrue(cfg.getGroupExclude().contains("ipausers"));
++        assertTrue(cfg.getGroupExclude().contains("allow_all_users"));
++    }
++
++    @Test
++    public void trailingSlashInUrlIsTrimmed() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "https://dataapi.dev.df.sbrf.ru///");
++        assertEquals("https://dataapi.dev.df.sbrf.ru", new IpaConfig(conf).getApiUrl());
++    }
++
++    @Test
++    public void ldapSettingsNotRequiredForAccessApiSource() {
++        // Neither ldap.url nor bind files are present — the constructor must not fail.
++        IpaConfig cfg = accessApiConfig();
++        assertTrue(cfg.isEnabled());
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void mtlsIsNotAnAcceptedAuthMode() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL,  "https://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, "mtls");
++        new IpaConfig(conf);
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void unknownAuthModeRejected() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL,  "https://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, "basic");
++        new IpaConfig(conf);
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void apiUrlIsRequired() {
++        new IpaConfig(baseConf());
++    }
++
++    @Test
++    public void apiPrincipalAndKeytabAreReadWhenSet() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "http://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_PRINCIPAL, "u_sdp_s_accessapi@DEV.DF.SBRF.RU");
++        conf.set(IpaConfig.API_KEYTAB, "/vault/secrets/om-accessapi.keytab");
++
++        IpaConfig cfg = new IpaConfig(conf);
++        assertEquals("u_sdp_s_accessapi@DEV.DF.SBRF.RU", cfg.getApiPrincipal());
++        assertEquals("/vault/secrets/om-accessapi.keytab", cfg.getApiKeytab());
++    }
++
++    @Test
++    public void gatewayAuthNeedsNoClientCredentials() {
++        // The egress gateway authenticates with its own certificate: the application
++        // needs neither a keytab nor a client certificate.
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "http://dataapi-mtls.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, IpaConfig.API_AUTH_GATEWAY);
++
++        IpaConfig cfg = new IpaConfig(conf);
++        assertTrue(cfg.isApiAuthGateway());
++    }
++
++    @Test(expected = IllegalStateException.class)
++    public void unknownAuthModeIsRejected() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "http://dataapi.dev.df.sbrf.ru");
++        conf.set(IpaConfig.API_AUTH, "basic");
++        new IpaConfig(conf);
++    }
++
++    @Test
++    public void apiPrincipalIsOptionalAndFallsBackToDaemonIdentity() {
++        IpaConfig cfg = accessApiConfig();
++        assertNull(cfg.getApiPrincipal());
++        assertNull(cfg.getApiKeytab());
++    }
++
++    private static Configuration baseConf() {
++        Configuration conf = new Configuration(false);
++        conf.setBoolean(IpaConfig.ENABLED, true);
++        conf.set(IpaConfig.SOURCE, IpaConfig.SOURCE_ACCESS_API);
++        return conf;
++    }
++
++    private static IpaConfig accessApiConfig() {
++        Configuration conf = baseConf();
++        conf.set(IpaConfig.API_URL, "https://dataapi.dev.df.sbrf.ru");
++        return new IpaConfig(conf);
++    }
++}
+diff --git a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java
+index 581de99d8..ece4d6506 100644
+--- a/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java
++++ b/ranger-ipa-userstore/src/test/java/org/apache/ranger/plugin/ipa/IpaGroupMappingTest.java
+@@ -74,6 +74,50 @@ public void unknownUserReturnsEmptyList() {
+         assertTrue(mapping.getGroups("nobody").isEmpty());
+     }
+ 
++    @Test
++    public void serviceUserIsSkippedEvenIfPresentInCache() {
++        // om is in the cache but marked as a service account: getGroups must return
++        // empty without consulting the cache or the resolver.
++        IpaUserGroupCache.INSTANCE.swap(singleUser("om", "should-not-leak"));
++        IpaGroupMapping.setServiceUsersForTests(
++                new HashSet<>(java.util.Arrays.asList("om", "scm", "s3g")));
++
++        IpaGroupMapping mapping = new IpaGroupMapping();
++        assertTrue(mapping.getGroups("om").isEmpty());
++    }
++
++    @Test
++    public void serviceUserMatchIsCaseInsensitive() {
++        IpaUserGroupCache.INSTANCE.swap(singleUser("OM", "x"));
++        IpaGroupMapping.setServiceUsersForTests(Collections.singleton("om"));
++
++        IpaGroupMapping mapping = new IpaGroupMapping();
++        assertTrue(mapping.getGroups("OM").isEmpty());
++    }
++
++    @Test
++    public void nonServiceUserStillResolvesFromCache() {
++        IpaUserGroupCache.INSTANCE.swap(singleUser("alice", "g1"));
++        IpaGroupMapping.setServiceUsersForTests(Collections.singleton("om"));
++
++        IpaGroupMapping mapping = new IpaGroupMapping();
++        List<String> groups = mapping.getGroups("alice");
++        assertEquals(1, groups.size());
++        assertTrue(groups.contains("g1"));
++    }
++
++    @Test
++    public void defaultServiceUsersCoverOzoneDaemons() {
++        IpaConfig cfg = new IpaConfig(new Configuration(false));
++        assertTrue(cfg.isServiceUser("om"));
++        assertTrue(cfg.isServiceUser("SCM"));
++        assertTrue(cfg.isServiceUser("s3g"));
++        assertTrue(cfg.isServiceUser("hadoop"));
++        assertTrue(cfg.isServiceUser("dr.who"));
++        assertTrue(!cfg.isServiceUser("alice"));
++        assertTrue(!cfg.isServiceUser(null));
++    }
++
+     @Test
+     public void cacheGroupsRefreshAndAddAreNoOps() {
+         IpaGroupMapping mapping = new IpaGroupMapping();
