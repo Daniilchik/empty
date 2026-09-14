@@ -1,0 +1,281 @@
+diff --git a/helm-charts/ozone/templates/_helpers.tpl b/helm-charts/ozone/templates/_helpers.tpl
+index 394d93e..9599a5a 100644
+--- a/helm-charts/ozone/templates/_helpers.tpl
++++ b/helm-charts/ozone/templates/_helpers.tpl
+@@ -511,7 +511,7 @@ vault.hashicorp.com/agent-inject-template-{{ $h.name }}-caCert.pem: |
+ */}}
+ {{- define "ozone.egressGateway.anyMtls" -}}
+ {{- $s := .Values.istio.egressGateway.tls.secman -}}
+-{{- $any := or $s.rangerMtls $s.fluentbitMtls $s.federateMtls -}}
++{{- $any := or $s.rangerMtls $s.fluentbitMtls $s.federateMtls (include "ozone.accessApi.egressEnabled" .) -}}
+ {{- if .Values.prometheus.enabled -}}
+ {{- range .Values.prometheus.remoteWrite -}}
+ {{- if hasKey . "mtls" -}}
+@@ -531,7 +531,7 @@ vault.hashicorp.com/agent-inject-template-{{ $h.name }}-caCert.pem: |
+ */}}
+ {{- define "ozone.egressGateway.vaultNeeded" -}}
+ {{- $s := .Values.istio.egressGateway.tls.secman -}}
+-{{- $caKeys := or $s.rangerCaKey $s.fluentbitCaKey $s.prometheusRwCaKey $s.federateCaKey $s.ipaCaKey $s.egressCaKey -}}
++{{- $caKeys := or $s.rangerCaKey $s.fluentbitCaKey $s.prometheusRwCaKey $s.federateCaKey $s.ipaCaKey $s.accessApiCaKey $s.egressCaKey -}}
+ {{- if .Values.prometheus.enabled -}}
+ {{- range .Values.prometheus.remoteWrite -}}
+ {{- if .caKey }}{{- $caKeys = .caKey -}}{{- end -}}
+@@ -586,6 +586,7 @@ vault.hashicorp.com/agent-inject-perms-egressgateway-ca: '0400'
+                    "egressgateway-prometheus-rw-upstream" $s.prometheusRwCaKey
+                    "egressgateway-federate-upstream" $s.federateCaKey
+                    "egressgateway-ipa-upstream" $s.ipaCaKey
++                   "egressgateway-accessapi-upstream" $s.accessApiCaKey
+                    "egressgateway" $s.egressCaKey -}}
+ {{- if $ctx.Values.prometheus.enabled -}}
+ {{- range $idx, $rw := $ctx.Values.prometheus.remoteWrite -}}
+@@ -648,7 +649,25 @@ Usage: {{ include "kerberos.principal" (dict "ctx" . "service" "scm") }}
+ {{- define "ozone.ldap.egressEnabled" -}}
+ {{- if gt (len .Values.ldap.hosts) 0 -}}
+ {{- if and .Values.hue.enabled .Values.hue.ldap.enabled -}}true
+-{{- else if and .Values.ranger.enabled (dig "ipa" "enabled" false .Values.ranger) -}}true
++{{- else if and .Values.ranger.enabled (dig "ipa" "enabled" false .Values.ranger) (eq (dig "ipa" "source" "ldap" .Values.ranger) "ldap") -}}true
++{{- end -}}
++{{- end -}}
++{{- end -}}
++
++{{/*
++  Хост AccessAPI из ranger.ipa.accessApi.url — для ServiceEntry и egress-маршрута.
++*/}}
++{{- define "ozone.accessApi.host" -}}
++{{- $u := dig "ipa" "accessApi" "url" "" .Values.ranger -}}
++{{- if $u -}}
++{{- regexReplaceAll "^https?://([^/:?#]+).*" $u "${1}" -}}
++{{- end -}}
++{{- end -}}
++
++{{- define "ozone.accessApi.egressEnabled" -}}
++{{- if and .Values.ranger.enabled (dig "ipa" "enabled" false .Values.ranger) -}}
++{{- if eq (dig "ipa" "source" "ldap" .Values.ranger) "accessapi" -}}
++{{- if include "ozone.accessApi.host" . -}}true{{- end -}}
+ {{- end -}}
+ {{- end -}}
+ {{- end -}}
+diff --git a/helm-charts/ozone/templates/configmap.yaml b/helm-charts/ozone/templates/configmap.yaml
+index afe44fe..c398a56 100644
+--- a/helm-charts/ozone/templates/configmap.yaml
++++ b/helm-charts/ozone/templates/configmap.yaml
+@@ -100,6 +100,20 @@ data:
+         <name>org.apache.ranger.ipa.enabled</name>
+         <value>true</value>
+       </property>
++      {{- if eq .Values.ranger.ipa.source "accessapi" }}
++      <property>
++        <name>org.apache.ranger.ipa.source</name>
++        <value>accessapi</value>
++      </property>
++      <property>
++        <name>org.apache.ranger.ipa.accessapi.url</name>
++        <value>{{ required "ranger.ipa.accessApi.url is required when ranger.ipa.source=accessapi" .Values.ranger.ipa.accessApi.url }}</value>
++      </property>
++      <property>
++        <name>org.apache.ranger.ipa.accessapi.auth</name>
++        <value>gateway</value>
++      </property>
++      {{- else }}
+       <property>
+         <name>org.apache.ranger.ipa.ldap.url</name>
+         <value>{{ .Values.ranger.ipa.url }}</value>
+@@ -144,6 +158,7 @@ data:
+         <name>org.apache.ranger.ipa.ldap.bind.password.file</name>
+         <value>/vault/secrets/om-ipa-bind-password</value>
+       </property>
++      {{- end }}
+       <property>
+         <name>org.apache.ranger.ipa.sync.interval.ms</name>
+         <value>{{ .Values.ranger.ipa.sync.intervalMs }}</value>
+diff --git a/helm-charts/ozone/templates/istio/egressgateway/gateway.yaml b/helm-charts/ozone/templates/istio/egressgateway/gateway.yaml
+index 48ca577..e5fab70 100644
+--- a/helm-charts/ozone/templates/istio/egressgateway/gateway.yaml
++++ b/helm-charts/ozone/templates/istio/egressgateway/gateway.yaml
+@@ -45,6 +45,9 @@
+ {{- if and .Values.secman.enabled .Values.secman.hostname }}
+   {{- $tlsHosts = append $tlsHosts .Values.secman.hostname }}
+ {{- end }}
++{{- if include "ozone.accessApi.egressEnabled" . }}
++  {{- $httpsHosts = append $httpsHosts (include "ozone.accessApi.host" .) }}
++{{- end }}
+ {{- if and .Values.fluentBit.enabled .Values.fluentBit.restlogsHost }}
+   {{- $httpsHosts = append $httpsHosts .Values.fluentBit.restlogsHost }}
+ {{- end }}
+diff --git a/helm-charts/ozone/templates/istio/egressgateway/routes.yaml b/helm-charts/ozone/templates/istio/egressgateway/routes.yaml
+index 9abef5c..490c44c 100644
+--- a/helm-charts/ozone/templates/istio/egressgateway/routes.yaml
++++ b/helm-charts/ozone/templates/istio/egressgateway/routes.yaml
+@@ -40,6 +40,9 @@
+     {{- $httpTargets = append $httpTargets (dict "name" "ranger" "host" $h "upstreamPort" $upPort "appPort" 80 "listener" 8443 "mtls" $caSecman.rangerMtls "caKey" $caSecman.rangerCaKey "upstreamCaFile" "/vault/secrets/egressgateway-ranger-upstream-ca") }}
+   {{- end }}
+ {{- end }}
++{{- if include "ozone.accessApi.egressEnabled" . }}
++  {{- $httpTargets = append $httpTargets (dict "name" "accessapi" "host" (include "ozone.accessApi.host" .) "upstreamPort" 443 "appPort" 80 "listener" 8443 "mtls" true "caKey" $caSecman.accessApiCaKey "upstreamCaFile" "/vault/secrets/egressgateway-accessapi-upstream-ca") }}
++{{- end }}
+ {{/*
+   Каждый prometheus.remoteWrite[] (если URL http://) уходит через egress
+   с TLS origination. Реальный HTTPS upstream port вычисляется из URL
+diff --git a/helm-charts/ozone/templates/istio/serviceentry.yaml b/helm-charts/ozone/templates/istio/serviceentry.yaml
+index 9cffad2..b4f9e5b 100644
+--- a/helm-charts/ozone/templates/istio/serviceentry.yaml
++++ b/helm-charts/ozone/templates/istio/serviceentry.yaml
+@@ -262,3 +262,28 @@ spec:
+   resolution: DNS
+ {{- end }}
+ {{- end }}
++{{- if include "ozone.accessApi.egressEnabled" . }}
++{{- $apiHost := include "ozone.accessApi.host" . }}
++---
++apiVersion: networking.istio.io/v1beta1
++kind: ServiceEntry
++metadata:
++  name: {{ include "ozone.fullname" . }}-accessapi-{{ $apiHost | replace "." "-" | trunc 50 | trimSuffix "-" }}
++  namespace: {{ include "ozone.namespace" . }}
++  labels:
++    {{- include "ozone.labels" . | nindent 4 }}
++spec:
++  exportTo:
++    - .
++  hosts:
++    - {{ $apiHost | quote }}
++  location: MESH_EXTERNAL
++  ports:
++    - name: http-accessapi
++      number: 80
++      protocol: HTTP
++    - name: https-accessapi
++      number: 443
++      protocol: HTTPS
++  resolution: DNS
++{{- end }}
+diff --git a/helm-charts/ozone/values.yaml b/helm-charts/ozone/values.yaml
+index e896f57..3c65fa6 100644
+--- a/helm-charts/ozone/values.yaml
++++ b/helm-charts/ozone/values.yaml
+@@ -274,6 +274,7 @@ istio:
+         prometheusRwCaKey: ""
+         federateCaKey: ""
+         ipaCaKey: ""
++        accessApiCaKey: ""
+         egressCaKey: ""
+       caFiles:
+         clientCert: /vault/secrets/egressgateway-client-cert
+@@ -741,6 +742,8 @@ ranger:
+   # containers that are NOT joined to corporate IPA.
+   ipa:
+     enabled: false
++    # ldap — группы из FreeIPA по LDAP; accessapi — из AccessAPI через egress (mTLS)
++    source: ldap
+     url: ""
+     baseDn: ""     # e.g. dc=vm,dc=esrt,dc=cloud,dc=sbrf,dc=ru
+     user:
+@@ -761,4 +764,6 @@ ranger:
+     secman:
+       bindDnKey:       ""   # e.g. hue_ldap_bind_dn
+       bindPasswordKey: ""   # e.g. hue_ldap_bind_password
++    accessApi:
++      url: ""   # e.g. http://dataapi-mtls.qa.df.sbrf.ru
+ 
+diff --git a/values/values-dev.yaml b/values/values-dev.yaml
+index da38925..90d250f 100644
+--- a/values/values-dev.yaml
++++ b/values/values-dev.yaml
+@@ -61,6 +61,7 @@ istio:
+         fluentbitCaKey: "logs_ca_chain"
+         prometheusRwCaKey: "logs_ca_chain"
+         ipaCaKey: "hue_ldap_ca_cert"
++        accessApiCaKey: "logs_ca_chain"
+ 
+ om:
+   enabled: true
+@@ -236,11 +237,14 @@ ranger:
+     serviceName: "dropapp-ozone-dev"
+   ipa:
+     enabled: true
++    source: accessapi
+     url: "ldap://tvlds-kap000127.delta.sbrf.ru:636 ldap://tvlds-kap000126.delta.sbrf.ru:636"
+     baseDn: "dc=vm,dc=esrt,dc=cloud,dc=sbrf,dc=ru"
+     secman:
+       bindDnKey:       ldap_bind_dn
+       bindPasswordKey: ldap_bind_pw
++    accessApi:
++      url: "http://dataapi-mtls.dev.df.sbrf.ru"
+ 
+ cli:
+   enabled: true
+diff --git a/values/values-ift-behe4mln.yaml b/values/values-ift-behe4mln.yaml
+index f02c53b..c74f0e7 100644
+--- a/values/values-ift-behe4mln.yaml
++++ b/values/values-ift-behe4mln.yaml
+@@ -53,6 +53,7 @@ istio:
+         fluentbitCaKey: "ca_chain"
+         prometheusRwCaKey: "ca_chain"
+         ipaCaKey: "ldap_ca_chain"
++        accessApiCaKey: "ca_chain"
+ 
+ om:
+   replicas: 3
+@@ -188,11 +189,16 @@ ranger:
+     serviceName: "iftdrpoznb2c_ozone"
+   ipa:
+     enabled: true
++    source: accessapi
++    # LDAP-настройки ниже при source: accessapi не используются —
++    # оставлены для быстрого отката.
+     url: "ldap://tvlds-acc000035.qa.df.sbrf.ru:636"
+     baseDn: "dc=qa,dc=df,dc=sbrf,dc=ru"
+     secman:
+       bindDnKey: hue_ldap_bind_dn
+       bindPasswordKey: hue_ldap_bind_password
++    accessApi:
++      url: "http://dataapi-mtls.qa.df.sbrf.ru"
+ 
+ cli:
+   image:
+diff --git a/values/values-ift.yaml b/values/values-ift.yaml
+index 23cd8a0..7bd8f27 100644
+--- a/values/values-ift.yaml
++++ b/values/values-ift.yaml
+@@ -73,6 +73,7 @@ istio:
+         fluentbitCaKey: "ca_chain"
+         prometheusRwCaKey: "ca_chain"
+         ipaCaKey: "ldap_ca_chain"
++        accessApiCaKey: "ca_chain"
+ 
+ om:
+   replicas: 3
+@@ -222,11 +223,14 @@ ranger:
+     serviceName: "iftdrpoznb2c_ozone"
+   ipa:
+     enabled: true
++    source: accessapi
+     url: "ldap://tvlds-acc000035.qa.df.sbrf.ru:636"
+     baseDn: "dc=qa,dc=df,dc=sbrf,dc=ru"
+     secman:
+       bindDnKey: hue_ldap_bind_dn
+       bindPasswordKey: hue_ldap_bind_password
++    accessApi:
++      url: "http://dataapi-mtls.qa.df.sbrf.ru"
+ 
+ cli:
+   image:
+diff --git a/values/values-prod.yaml b/values/values-prod.yaml
+index 201a868..b42dee3 100644
+--- a/values/values-prod.yaml
++++ b/values/values-prod.yaml
+@@ -361,11 +361,14 @@ ranger:
+     serviceName: ozndabdq2i0fy_ozone
+   ipa:
+     enabled: true
++    source: accessapi
+     url: "ldap://pvli-um0029.df.sbrf.ru:636"
+     baseDn: "dc=df,dc=sbrf,dc=ru"
+     secman:
+       bindDnKey: ldap_bind_dn
+       bindPasswordKey: ldap_bind_pw
++    accessApi:
++      url: "http://dataapi-mtls.df.sbrf.ru"
+ 
+ cli:
+   image:
