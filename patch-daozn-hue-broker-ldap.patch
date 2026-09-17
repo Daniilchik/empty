@@ -1,0 +1,365 @@
+diff --git a/helm-charts/ozone/templates/_helpers.tpl b/helm-charts/ozone/templates/_helpers.tpl
+index 9599a5a..1e435a2 100644
+--- a/helm-charts/ozone/templates/_helpers.tpl
++++ b/helm-charts/ozone/templates/_helpers.tpl
+@@ -671,3 +671,52 @@ Usage: {{ include "kerberos.principal" (dict "ctx" . "service" "scm") }}
+ {{- end -}}
+ {{- end -}}
+ {{- end -}}
++
++{{- define "ozone.hue.s3gHost" -}}
++{{- include "ozone.ingress.host" (dict "host" .Values.s3g.ingress.host "component" .Values.s3g.serviceName "ctx" .) -}}
++{{- end -}}
++
++{{- define "ozone.hue.s3gMtls" -}}
++{{- if .Values.hue.enabled -}}
++{{- if not .Values.global.security.kerberos.enabled -}}
++{{- fail "hue requires global.security.kerberos.enabled (per-user S3G secrets are issued over SPNEGO and mTLS)" -}}
++{{- end -}}
++{{- $s3gHost := include "ozone.hue.s3gHost" . -}}
++{{- $mutual := false -}}
++{{- range (include "ozone.ingressGateway.tlsHosts" . | fromJsonArray) -}}
++{{- if and (eq .host $s3gHost) .mutual -}}{{- $mutual = true -}}{{- end -}}
++{{- end -}}
++{{- if not (and .Values.istio.enabled .Values.istio.ingressGateway.enabled $mutual) -}}
++{{- fail "hue requires s3g.enabled, s3g.ingress.enabled, s3g.ingress.secman.tls, secman.enabled, istio.enabled and istio.ingressGateway.enabled (Hue reaches S3G only over mTLS via the ingress gateway)" -}}
++{{- end -}}
++true
++{{- end -}}
++{{- end -}}
++
++{{- define "ozone.hue.s3gClientCommonName" -}}
++{{- if .Values.hue.s3g.clientCommonName -}}
++{{- .Values.hue.s3g.clientCommonName -}}
++{{- else -}}
++{{- printf "hue-client-ozone-%s.%s" (include "ozone.namespace" .) .Values.global.ingress.baseDomain -}}
++{{- end -}}
++{{- end -}}
++
++{{- define "ozone.hue.s3gVaultAnnotations" -}}
++{{- $fetch := include "ozone.secman.certPath" . -}}
++{{- $cn := include "ozone.hue.s3gClientCommonName" . -}}
++vault.hashicorp.com/agent-inject-secret-hue-s3g-client.pem: 'true'
++vault.hashicorp.com/agent-inject-template-hue-s3g-client.pem: |
++  {{`{{- with secret `}}"{{ $fetch }}" "common_name={{ $cn }}" "alt_names={{ $cn }}" "format=pem"{{` -}}`}}
++  {{`{{ .Data.certificate }}`}}
++  {{`{{ .Data.issuing_ca }}`}}
++  {{`{{ .Data.private_key }}`}}
++  {{`{{- end }}`}}
++vault.hashicorp.com/agent-inject-perms-hue-s3g-client.pem: '0440'
++vault.hashicorp.com/agent-inject-secret-hue-s3g-ca.pem: 'true'
++vault.hashicorp.com/agent-inject-template-hue-s3g-ca.pem: |
++  {{`{{- with secret `}}"{{ $fetch }}" "common_name={{ $cn }}" "alt_names={{ $cn }}" "format=pem"{{` -}}`}}
++  {{`{{ .Data.issuing_ca }}`}}
++  {{`{{ .Data.root_cert }}`}}
++  {{`{{- end }}`}}
++vault.hashicorp.com/agent-inject-perms-hue-s3g-ca.pem: '0440'
++{{- end -}}
+diff --git a/helm-charts/ozone/templates/hue/configmap.yaml b/helm-charts/ozone/templates/hue/configmap.yaml
+index 6fb3234..def82fd 100644
+--- a/helm-charts/ozone/templates/hue/configmap.yaml
++++ b/helm-charts/ozone/templates/hue/configmap.yaml
+@@ -48,7 +48,7 @@ data:
+         options='{"options":"-c search_path=hue","target_session_attrs":"read-write"}'
+ 
+       [[auth]]
+-        backend={{ .Values.hue.auth.backend }}
++        backend={{ if .Values.hue.ldap.enabled }}desktop.auth.backend.LdapBackend{{ else }}{{ .Values.hue.auth.backend }}{{ end }}
+         idle_session_timeout={{ .Values.hue.auth.idleSessionTimeout }}
+ 
+       {{- if .Values.hue.ssl.enabled }}
+@@ -61,6 +61,24 @@ data:
+         ssl_cipher_list={{ .Values.hue.ssl.cipherList }}
+       {{- end }}
+ 
++      {{- if .Values.hue.ldap.enabled }}
++
++      [[ldap]]
++        ldap_url={{ range $i, $h := .Values.ldap.hosts }}{{ if $i }} {{ end }}ldap://{{ $h }}:{{ $.Values.ldap.port }}{{ end }}
++        use_start_tls=false
++        search_bind_authentication=true
++        base_dn="{{ .Values.ldap.baseDn }}"
++        create_users_on_login=true
++        sync_groups_on_login=true
++        [[[users]]]
++          user_filter="{{ .Values.ldap.users.filter }}"
++          user_name_attr={{ .Values.ldap.users.nameAttr }}
++        [[[groups]]]
++          group_filter="{{ .Values.ldap.groups.filter }}"
++          group_name_attr={{ .Values.ldap.groups.nameAttr }}
++          group_member_attr={{ .Values.ldap.groups.memberAttr }}
++      {{- end }}
++
+     [notebook]
+       show_notebooks=false
+       [[interpreters]]
+@@ -83,14 +101,11 @@ data:
+       {{- end }}
+       [[aws_accounts]]
+         [[[default]]]
+-          {{- if not .Values.global.security.kerberos.enabled }}
+           access_key_id={{ .Values.hue.aws.s3AccessKeyId }}
+           secret_access_key={{ .Values.hue.aws.s3SecretAccessKey }}
+-          {{- end }}
+-          host={{ .Values.s3g.serviceName }}-rest.{{ include "ozone.namespace" $ }}.svc.{{ $.Values.global.clusterDomain }}
+-          port={{ .Values.s3g.service.rest.port }}
++          host={{ include "ozone.hue.s3gHost" . }}
+           use_nvl_region_for_v4_auth=True
+           dummy_region=ozone
+-          is_secure={{ .Values.global.security.ssl.enabled }}
++          is_secure=true
+           calling_format=boto.s3.connection.OrdinaryCallingFormat
+ {{- end }}
+diff --git a/helm-charts/ozone/templates/hue/deployment.yaml b/helm-charts/ozone/templates/hue/deployment.yaml
+index 6c33d5e..b081c26 100644
+--- a/helm-charts/ozone/templates/hue/deployment.yaml
++++ b/helm-charts/ozone/templates/hue/deployment.yaml
+@@ -14,7 +14,8 @@ spec:
+     matchLabels:
+       {{- include "ozone.selectorLabels" . | nindent 6 }}
+       component: {{ .Values.hue.component }}
+-  {{- $vaultNeeded := and .Values.secman.enabled (or .Values.hue.secman.dbPasswordKey .Values.hue.secman.sessionSecretKey) }}
++  {{- $s3gMtls := include "ozone.hue.s3gMtls" . }}
++  {{- $vaultNeeded := and .Values.secman.enabled (or $s3gMtls .Values.hue.secman.dbPasswordKey .Values.hue.secman.sessionSecretKey .Values.hue.secman.ldapBindDnKey .Values.hue.secman.ldapBindPasswordKey) }}
+   template:
+     metadata:
+       labels:
+@@ -31,6 +32,9 @@ spec:
+         traffic.synapse.sber/enableUDP: "false"
+         {{- if $vaultNeeded }}
+         {{- include "ozone.secmanAnnotations" . | nindent 8 }}
++        {{- if $s3gMtls }}
++        {{- include "ozone.hue.s3gVaultAnnotations" . | nindent 8 }}
++        {{- end }}
+         {{- if .Values.hue.secman.dbPasswordKey }}
+         vault.hashicorp.com/agent-inject-secret-hue-db-password: 'true'
+         vault.hashicorp.com/agent-inject-template-hue-db-password: |
+@@ -47,6 +51,22 @@ spec:
+           {{`{{- end }}`}}
+         vault.hashicorp.com/agent-inject-perms-hue-secret-key: '0440'
+         {{- end }}
++        {{- if .Values.hue.secman.ldapBindDnKey }}
++        vault.hashicorp.com/agent-inject-secret-hue-ldap-bind-dn: 'true'
++        vault.hashicorp.com/agent-inject-template-hue-ldap-bind-dn: |
++          {{`{{- with secret `}}"{{ tpl .Values.secman.path . }}"{{` -}}`}}
++          {{`{{ .Data.`}}{{ .Values.hue.secman.ldapBindDnKey }}{{` }}`}}
++          {{`{{- end }}`}}
++        vault.hashicorp.com/agent-inject-perms-hue-ldap-bind-dn: '0440'
++        {{- end }}
++        {{- if .Values.hue.secman.ldapBindPasswordKey }}
++        vault.hashicorp.com/agent-inject-secret-hue-ldap-bind-password: 'true'
++        vault.hashicorp.com/agent-inject-template-hue-ldap-bind-password: |
++          {{`{{- with secret `}}"{{ tpl .Values.secman.path . }}"{{` -}}`}}
++          {{`{{ .Data.`}}{{ .Values.hue.secman.ldapBindPasswordKey }}{{` }}`}}
++          {{`{{- end }}`}}
++        vault.hashicorp.com/agent-inject-perms-hue-ldap-bind-password: '0440'
++        {{- end }}
+         {{- end }}
+     spec:
+       {{- include "ozone.podSecurityContext" $ | nindent 6 }}
+@@ -75,6 +95,26 @@ spec:
+             - name: HUE_SECRET_KEY_FILE
+               value: "/vault/secrets/hue-secret-key"
+             {{- end }}
++            {{- if and $vaultNeeded .Values.hue.secman.ldapBindDnKey }}
++            - name: HUE_LDAP_BIND_DN_FILE
++              value: "/vault/secrets/hue-ldap-bind-dn"
++            {{- end }}
++            {{- if and $vaultNeeded .Values.hue.secman.ldapBindPasswordKey }}
++            - name: HUE_LDAP_BIND_PASSWORD_FILE
++              value: "/vault/secrets/hue-ldap-bind-password"
++            {{- end }}
++            {{- if $s3gMtls }}
++            - name: OZONE_S3G_ENDPOINT
++              value: {{ printf "https://%s" (include "ozone.hue.s3gHost" .) | quote }}
++            - name: KERBEROS_REALM
++              value: {{ .Values.global.security.kerberos.realm | quote }}
++            - name: OZONE_S3G_CLIENT_CERT
++              value: "/vault/secrets/hue-s3g-client.pem"
++            - name: OZONE_S3G_CLIENT_KEY
++              value: "/vault/secrets/hue-s3g-client.pem"
++            - name: OZONE_S3G_CA_FILE
++              value: "/vault/secrets/hue-s3g-ca.pem"
++            {{- end }}
+           ports:
+             - name: web
+               containerPort: {{ .Values.hue.service.port }}
+@@ -94,6 +134,7 @@ spec:
+               subPath: log.conf
+             - name: ozone-config
+               mountPath: /ozone/etc/hadoop
++            {{- include "ozone.krb5VolumeMount" . | nindent 12 }}
+             {{- include "ozone.writableTmpMount" . | nindent 12 }}
+             {{- if .Values.fluentBit.enabled }}
+             {{- include "ozone.fluentbit.logsMount" . | nindent 12 }}
+@@ -131,7 +172,9 @@ spec:
+       volumes:
+         {{- include "ozone.writableTmpVolume" . | nindent 8 }}
+         - name: hue-conf-dir
+-          emptyDir: {}
++          emptyDir:
++            medium: Memory
++            sizeLimit: 16Mi
+         {{- if .Values.fluentBit.enabled }}
+         {{- include "ozone.fluentbit.volumes" . | nindent 8 }}
+         {{- end }}
+@@ -139,6 +182,7 @@ spec:
+           configMap:
+             name: {{ include "ozone.fullname" $ }}-config
+             defaultMode: 256
++        {{- include "ozone.krb5Volume" . | nindent 8 }}
+         - name: hue-config
+           configMap:
+             name: {{ include "ozone.fullname" . }}-hue-config
+diff --git a/helm-charts/ozone/templates/istio/serviceentry.yaml b/helm-charts/ozone/templates/istio/serviceentry.yaml
+index b4f9e5b..d5ad311 100644
+--- a/helm-charts/ozone/templates/istio/serviceentry.yaml
++++ b/helm-charts/ozone/templates/istio/serviceentry.yaml
+@@ -287,3 +287,26 @@ spec:
+       protocol: HTTPS
+   resolution: DNS
+ {{- end }}
++{{- if include "ozone.hue.s3gMtls" . }}
++---
++apiVersion: networking.istio.io/v1beta1
++kind: ServiceEntry
++metadata:
++  name: {{ include "ozone.fullname" . }}-hue-s3g-ingress
++  namespace: {{ include "ozone.namespace" . }}
++  labels:
++    {{- include "ozone.labels" . | nindent 4 }}
++spec:
++  exportTo:
++    - .
++  hosts:
++    - {{ include "ozone.hue.s3gHost" . | quote }}
++  location: MESH_EXTERNAL
++  ports:
++    - name: tls-s3g-ingress
++      number: 443
++      protocol: TLS
++  resolution: DNS
++  endpoints:
++    - address: {{ printf "istio-ingressgateway-%s.%s.svc.%s" .Values.istio.ingressGateway.selectorLabel (include "ozone.namespace" .) .Values.global.clusterDomain }}
++{{- end }}
+diff --git a/helm-charts/ozone/values.yaml b/helm-charts/ozone/values.yaml
+index 3c65fa6..58e568d 100644
+--- a/helm-charts/ozone/values.yaml
++++ b/helm-charts/ozone/values.yaml
+@@ -127,6 +127,64 @@ ldap:
+     nameAttr: "cn"
+     memberAttr: "member"
+ 
++hue:
++  enabled: false
++  replicas: 1
++  component: hue
++  serviceName: hue
++  image:
++    registry: ""
++    repository: hue@sha256
++    tag: ""
++  resources: {}
++  service:
++    port: 8888
++  ingress:
++    enabled: false
++    className: nginx
++    host: ""
++    secman:
++      tls: false
++      mutual: false
++  config:
++    secretKey: ""
++    timeZone: "Europe/Moscow"
++    djangoDebugMode: false
++    databaseLogging: false
++    sendDebugMessages: false
++    http500DebugMode: false
++    appsBlacklist: "distcp,impala,pig,rdbms,search,security,zookeeper,importer,jobbrowser,hive,metastore,hbase,spark,oozie,jobsub"
++    ini: ""
++  database:
++    engine: postgresql_psycopg2
++    hosts: []
++    port: 5432
++    name: hue
++    user: hue
++    password: ""
++  secman:
++    dbPasswordKey: ""
++    sessionSecretKey: ""
++    ldapBindDnKey: ""
++    ldapBindPasswordKey: ""
++  auth:
++    backend: desktop.auth.backend.AllowFirstUserDjangoBackend
++    idleSessionTimeout: -1
++  ldap:
++    enabled: false
++  ssl:
++    enabled: false
++    certificate: ""
++    privateKey: ""
++    certificateChain: ""
++    cacerts: ""
++    cipherList: ""
++  aws:
++    s3AccessKeyId: fallback
++    s3SecretAccessKey: fallback
++  s3g:
++    clientCommonName: ""
++
+ # Fluent-bit sidecar — ships /var/log/ozone/<component>.log and <component>-audit.log
+ # (where applicable) to the external collector via http+TLS.
+ # Override image/appId/restlogsHost per environment in values-<env>.yaml.
+diff --git a/values/values-dev.yaml b/values/values-dev.yaml
+index 90d250f..28942a4 100644
+--- a/values/values-dev.yaml
++++ b/values/values-dev.yaml
+@@ -179,12 +179,14 @@ hue:
+   secman:
+     dbPasswordKey: hue_db_password
+     sessionSecretKey: hue_session_secret_key
++    ldapBindDnKey: ldap_bind_dn
++    ldapBindPasswordKey: ldap_bind_pw
+   # Authentication (maps to [[auth]] sub-section)
+   auth:
+     backend: "desktop.auth.backend.AllowFirstUserDjangoBackend"
+     idleSessionTimeout: -1
+   ldap:
+-    enabled: false
++    enabled: true
+   # SSL/TLS settings (maps to [[ssl]] sub-section)
+   ssl:
+     enabled: false
+diff --git a/values/values-ift-behe4mln.yaml b/values/values-ift-behe4mln.yaml
+index c74f0e7..e7db83c 100644
+--- a/values/values-ift-behe4mln.yaml
++++ b/values/values-ift-behe4mln.yaml
+@@ -146,8 +146,10 @@ hue:
+   secman:
+     dbPasswordKey: hue_db_password
+     sessionSecretKey: hue_session_secret_key
++    ldapBindDnKey: hue_ldap_bind_dn
++    ldapBindPasswordKey: hue_ldap_bind_password
+   ldap:
+-    enabled: false
++    enabled: true
+ 
+ hiveMetastore:
+   enabled: true
+diff --git a/values/values-ift.yaml b/values/values-ift.yaml
+index 7bd8f27..adbbc13 100644
+--- a/values/values-ift.yaml
++++ b/values/values-ift.yaml
+@@ -181,8 +181,10 @@ hue:
+   secman:
+     dbPasswordKey: hue_db_password
+     sessionSecretKey: hue_session_secret_key
++    ldapBindDnKey: hue_ldap_bind_dn
++    ldapBindPasswordKey: hue_ldap_bind_password
+   ldap:
+-    enabled: false
++    enabled: true
+ 
+ hiveMetastore:
+   enabled: true
