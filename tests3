@@ -1,0 +1,5 @@
+curl -i --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" -H "Transfer-Encoding: chunked" -T /tmp/part1.bin "http://S3G:9878/BUCKET/diag-repro.parquet?partNumber=1&uploadId=UPLOAD_ID"
+
+aws s3api complete-multipart-upload --endpoint-url http://S3G:9878 --bucket BUCKET --key diag-repro.parquet --upload-id UPLOAD_ID --multipart-upload 'Parts=[{ETag="ETAG_FROM_CURL",PartNumber=1}]'
+
+aws s3 cp --endpoint-url http://S3G:9878 s3://BUCKET/diag-repro.parquet - | cmp - /tmp/part1.bin && echo OK
